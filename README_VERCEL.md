@@ -5,7 +5,7 @@
 - **Financial-audit production deployment, 2 October 2026:** `dpl_4vjyNZd57t3Q7UsqysTAJWBczjgB`
 - **GitHub:** [stelioskoul/profit-tracker](https://github.com/stelioskoul/profit-tracker) (renamed from `beprofit-alternative`)
 
-The full React/Express/tRPC app uses Supabase Postgres. The audited 2 October release was uploaded directly to Vercel. The project is now connected to GitHub: branch pushes create previews and merging to `main` deploys production. `vercel.json` runs `pnpm build:vercel`, which builds React, copies generated static assets to `public/`, and bundles the audited Express adapter into `dist/vercel-api.cjs`. The root `app.cjs` exports that bundle; Vercel serves `public/**` through its CDN; `outputDirectory: "public"` explicitly includes assets generated during the Git build. Verify a branch preview before merging deployment changes.
+The full React/Express/tRPC app uses Supabase Postgres. The audited 2 October release was uploaded directly to Vercel. The project is now connected to GitHub: branch pushes create previews and merging to `main` builds production. `vercel.json` runs `pnpm build:vercel`, which builds React and generates `vercel-package/` containing the compiled Express `server.cjs` and `public/` assets together. Vercel's output directory is `vercel-package`, so both the server and CDN assets are included. The root `app.cjs` exposes the packaged Express app for framework detection and local smoke checks. Verify the deployment's assets and runtime before promoting a release. If Instant Rollback is active, production builds need explicit promotion after verification.
 
 ## Verification and limits
 
@@ -44,7 +44,7 @@ node scripts/build-vercel.mjs
 
 If a generated root `public/` already exists, replace only that generated output after checking it contains no user-authored assets. The bundler refuses to overwrite an unrecognized `vercel-package/`; a recognized prior generated package is regenerated safely. Deploy **the generated `vercel-package/` directory** to the existing Vercel project with its protected settings. Do not commit this output, `.env` files or tokens.
 
-The existing standalone `pnpm build`/`pnpm start` and Docker workflows remain available. The `vercel/server.ts` adapter is only for Vercel; it does not own an HTTP listener. The Git deployment build bundles this adapter before Vercel traces `app.cjs`, avoiding extensionless TypeScript imports and preserving the SPA/API fallback guards. The separate `scripts/build-vercel.mjs` workflow remains available for generating a standalone upload package.
+The existing standalone `pnpm build`/`pnpm start` and Docker workflows remain available. The `vercel/server.ts` adapter is only for Vercel; it does not own an HTTP listener. The Git deployment and standalone upload workflows use the same generated package. The adapter bundles its SPA HTML and dependencies, avoiding extensionless TypeScript imports while preserving the SPA/API fallback guards.
 
 Sources: [Vercel Express](https://vercel.com/docs/frameworks/backend/express), [Vercel Node.js Functions](https://vercel.com/docs/functions/runtimes/node-js).
 

@@ -7,24 +7,31 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plus, Trash2, Save } from "lucide-react";
 import { toast } from "sonner";
+import { SHIPPING_COUNTRIES, type ShippingCountry } from "@shared/shipping-regions";
 
 type ShippingMethod = "Standard" | "Express";
-type Country = "US" | "EU" | "CA";
-type QuantityPricing = Record<number, number>; // { 1: 5.00, 2: 7.00, 3: 9.00, 4: 11.00 }
+type Country = ShippingCountry;
+type QuantityPricing = Record<number, number | undefined>;
 type MethodPricing = Record<ShippingMethod, QuantityPricing>;
 type CountryPricing = Record<Country, MethodPricing>;
 
 interface ShippingConfigEditorProps {
   variantId: string;
   productTitle: string;
-  initialConfig?: CountryPricing;
+  initialConfig?: Partial<CountryPricing>;
   onSave: (config: CountryPricing) => void;
   isSaving?: boolean;
 }
 
-const COUNTRIES: Country[] = ["US", "EU", "CA"];
+const COUNTRIES = SHIPPING_COUNTRIES;
 const METHODS: ShippingMethod[] = ["Standard", "Express"];
-const DEFAULT_QUANTITIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+function normalizeConfig(initialConfig?: Partial<CountryPricing>): CountryPricing {
+  return Object.fromEntries(COUNTRIES.map(country => [country, {
+    Standard: { ...initialConfig?.[country]?.Standard },
+    Express: { ...initialConfig?.[country]?.Express },
+  }])) as CountryPricing;
+}
 
 export function ShippingConfigEditor({
   variantId,
@@ -33,30 +40,18 @@ export function ShippingConfigEditor({
   onSave,
   isSaving = false,
 }: ShippingConfigEditorProps) {
-  const [config, setConfig] = useState<CountryPricing>(() => {
-    if (initialConfig) return initialConfig;
-    
-    // Initialize with empty structure
-    const emptyConfig: CountryPricing = {} as CountryPricing;
-    COUNTRIES.forEach(country => {
-      emptyConfig[country] = {} as MethodPricing;
-      METHODS.forEach(method => {
-        emptyConfig[country][method] = {};
-      });
-    });
-    return emptyConfig;
-  });
+  const [config, setConfig] = useState<CountryPricing>(() => normalizeConfig(initialConfig));
 
   // Update config when initialConfig changes (for edit dialog)
   useEffect(() => {
     if (initialConfig) {
-      setConfig(initialConfig);
+      setConfig(normalizeConfig(initialConfig));
     }
   }, [initialConfig]);
 
   const updatePrice = (country: Country, method: ShippingMethod, quantity: number, price: string) => {
-    const numPrice = parseFloat(price);
-    if (isNaN(numPrice) || numPrice < 0) return;
+    const numPrice = price.trim() === "" ? undefined : Number(price);
+    if (numPrice !== undefined && (!Number.isFinite(numPrice) || numPrice < 0)) return;
 
     setConfig(prev => ({
       ...prev,
@@ -96,7 +91,7 @@ export function ShippingConfigEditor({
         ...prev[country],
         [method]: {
           ...(prev[country]?.[method] || {}),
-          [nextQuantity]: 0,
+          [nextQuantity]: undefined,
         },
       },
     }));
@@ -107,7 +102,7 @@ export function ShippingConfigEditor({
     let hasData = false;
     for (const country of COUNTRIES) {
       for (const method of METHODS) {
-        if (Object.keys(config[country][method]).length > 0) {
+        if (Object.values(config[country][method]).some(value => value !== undefined)) {
           hasData = true;
           break;
         }
@@ -133,7 +128,7 @@ export function ShippingConfigEditor({
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="US" className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-6">
             {COUNTRIES.map(country => (
               <TabsTrigger key={country} value={country}>
                 {country}
@@ -171,7 +166,7 @@ export function ShippingConfigEditor({
                         {quantities.map(qty => (
                           <div key={qty} className="flex items-center gap-2 p-3 border rounded-lg">
                             <div className="flex-1">
-                              <Label className="text-xs text-muted-foreground">
+                              <Label htmlFor={`${variantId}-${country}-${method}-${qty}`} className="text-xs text-muted-foreground">
                                 {qty} {qty === 1 ? "pc" : "pcs"}
                               </Label>
                               <div className="flex items-center gap-1 mt-1">
@@ -179,10 +174,12 @@ export function ShippingConfigEditor({
                                   $
                                 </span>
                                 <Input
+                                  id={`${variantId}-${country}-${method}-${qty}`}
+                                  aria-label={`${country} ${method} shipping for ${qty} ${qty === 1 ? "piece" : "pieces"}`}
                                   type="number"
                                   step="0.01"
                                   min="0"
-                                  value={config[country]?.[method]?.[qty] || ""}
+                                  value={config[country]?.[method]?.[qty] ?? ""}
                                   onChange={(e) => updatePrice(country, method, qty, e.target.value)}
                                   className="h-8"
                                   placeholder="0.00"

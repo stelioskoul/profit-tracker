@@ -366,13 +366,17 @@ export async function getShippingConfigByStoreId(storeId: number) {
       id: productShippingProfiles.id,
       storeId: productShippingProfiles.storeId,
       variantId: productShippingProfiles.variantId,
+      profileId: shippingProfiles.id,
       productTitle: productShippingProfiles.productTitle,
       configJson: shippingProfiles.configJson,
       createdAt: productShippingProfiles.createdAt,
       updatedAt: productShippingProfiles.updatedAt,
     })
     .from(productShippingProfiles)
-    .innerJoin(shippingProfiles, eq(productShippingProfiles.profileId, shippingProfiles.id))
+    .innerJoin(shippingProfiles, and(
+      eq(productShippingProfiles.profileId, shippingProfiles.id),
+      eq(productShippingProfiles.storeId, shippingProfiles.storeId),
+    ))
     .where(eq(productShippingProfiles.storeId, storeId));
   
   // Combine both sources (profile configs take precedence over direct configs)

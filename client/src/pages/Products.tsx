@@ -85,8 +85,10 @@ export default function Products() {
 
   const importCogsMutation = trpc.config.importCogsBulk.useMutation({
     onSuccess: (data) => {
-      toast.success(`Successfully imported ${data.count} COGS configurations`);
+      toast.success(`Successfully imported ${data.count} product configurations`);
       refetchCogs();
+      refetchAssignments();
+      refetchShippingConfigs();
       refetch();
     },
     onError: (error) => {

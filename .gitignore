@@ -112,3 +112,6 @@ temp/
 *.db
 *.sqlite
 *.sqlite3
+
+# Generated deployment output and local Vercel project state
+/.vercel/

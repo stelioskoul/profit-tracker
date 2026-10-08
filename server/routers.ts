@@ -1343,7 +1343,7 @@ export const appRouter = router({
           variantId: input.variantId,
           productTitle: null,
           cogsValue: input.cogsValue,
-          currency: "EUR",
+          currency: "USD",
         });
 
         // Cache invalidation removed

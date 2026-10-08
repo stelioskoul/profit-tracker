@@ -26,7 +26,7 @@ export default function Products() {
     { enabled: isAuthenticated && storeId > 0 }
   );
 
-  const { data: cogsConfigs } = trpc.config.getCogs.useQuery(
+  const { data: cogsConfigs, refetch: refetchCogs } = trpc.config.getCogs.useQuery(
     { storeId },
     { enabled: isAuthenticated && storeId > 0 }
   );
@@ -49,6 +49,7 @@ export default function Products() {
   const saveCogsMutation = trpc.config.setCogs.useMutation({
     onSuccess: () => {
       toast.success("COGS saved successfully");
+      refetchCogs();
       refetch();
     },
     onError: (error) => {
@@ -85,6 +86,7 @@ export default function Products() {
   const importCogsMutation = trpc.config.importCogsBulk.useMutation({
     onSuccess: (data) => {
       toast.success(`Successfully imported ${data.count} COGS configurations`);
+      refetchCogs();
       refetch();
     },
     onError: (error) => {

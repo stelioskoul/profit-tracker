@@ -7,7 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { getLoginUrl } from "@/const";
 import { trpc } from "@/lib/trpc";
 import { ArrowLeft, CheckCircle, Loader2, XCircle } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { toast } from "sonner";
 
@@ -24,6 +24,13 @@ export default function Connections() {
   const [showManualFacebook, setShowManualFacebook] = useState(false);
   const [facebookToken, setFacebookToken] = useState("");
   const [facebookAdAccountId, setFacebookAdAccountId] = useState("");
+  const [pendingAccountId, setPendingAccountId] = useState("");
+  const [existingConnectionId, setExistingConnectionId] = useState("");
+  const [facebookStatus, setFacebookStatus] = useState(() => new URLSearchParams(window.location.search).get("facebook"));
+  useEffect(() => {
+    const messages: Record<string, string> = { cancelled: "Facebook login was cancelled. You can try again.", no_accounts: "No ad accounts were granted. Log in again and select your ad account.", failed: "Facebook connection failed. Check the app configuration and try again." };
+    if (facebookStatus && messages[facebookStatus]) toast.error(messages[facebookStatus]);
+  }, [facebookStatus, storeId]);
 
   const { data: shopifyConn, refetch: refetchShopify } = trpc.shopify.getConnection.useQuery(
     { storeId },
@@ -36,6 +43,7 @@ export default function Connections() {
       toast.success("Shopify connected successfully");
       refetchShopify();
       utils.stores.getById.invalidate({ id: storeId });
+      utils.metrics.getProfit.invalidate();
     },
     onError: error => toast.error(error.message),
   });
@@ -44,6 +52,29 @@ export default function Connections() {
     { storeId },
     { enabled: isAuthenticated && storeId > 0 }
   );
+
+  const { data: pendingFacebook, error: pendingFacebookError } = trpc.facebook.pendingAccounts.useQuery(
+    { storeId }, { enabled: isAuthenticated && storeId > 0, retry: false }
+  );
+  const { data: existingFacebook } = trpc.facebook.availableConnections.useQuery(undefined, { enabled: isAuthenticated });
+  const reusableAccounts = (existingFacebook || []).filter(connection => connection.storeId !== storeId);
+  const refreshFacebook = async () => {
+    await Promise.all([refetchFacebook(), utils.facebook.availableConnections.invalidate(), utils.facebook.pendingAccounts.invalidate({ storeId }), utils.metrics.getProfit.invalidate()]);
+  };
+  const pendingFacebookMutation = trpc.facebook.connectPending.useMutation({
+    onSuccess: () => {
+      toast.success("Facebook ad account connected");
+      setPendingAccountId("");
+      setFacebookStatus(null);
+      window.history.replaceState(null, "", window.location.pathname);
+      refreshFacebook();
+    },
+    onError: error => toast.error(error.message),
+  });
+  const existingFacebookMutation = trpc.facebook.connectExisting.useMutation({
+    onSuccess: () => { toast.success("Facebook ad account connected"); setExistingConnectionId(""); refreshFacebook(); },
+    onError: error => toast.error(error.message),
+  });
 
   const shopifyAuthMutation = trpc.shopify.getAuthUrl.useMutation({
     onSuccess: (data) => {
@@ -86,7 +117,7 @@ export default function Connections() {
   const facebookDisconnectMutation = trpc.facebook.disconnect.useMutation({
     onSuccess: () => {
       toast.success("Facebook disconnected");
-      refetchFacebook();
+      refreshFacebook();
     },
   });
 
@@ -96,7 +127,7 @@ export default function Connections() {
       setFacebookToken("");
       setFacebookAdAccountId("");
       setShowManualFacebook(false);
-      refetchFacebook();
+      refreshFacebook();
     },
     onError: (error) => {
       toast.error(error.message);
@@ -275,12 +306,33 @@ export default function Connections() {
               </div>
             </CardHeader>
             <CardContent>
+              {pendingFacebookError && <p role="alert" className="text-sm text-destructive mb-4">{pendingFacebookError.message}</p>}
+              {facebookStatus === "select" && pendingFacebook === null && <p role="alert" className="text-sm text-muted-foreground mb-4">Your Facebook login selection expired. Connect with Facebook OAuth again.</p>}
+              {pendingFacebook && (
+                <div className="space-y-3 border rounded-lg p-4 mb-4">
+                  <p className="font-medium">Facebook login completed. Choose your ad account.</p>
+                  <Label htmlFor="pendingFacebookAccount">Facebook ad account</Label>
+                  <Select value={pendingAccountId} onValueChange={setPendingAccountId}>
+                    <SelectTrigger id="pendingFacebookAccount"><SelectValue placeholder="Select an ad account" /></SelectTrigger>
+                    <SelectContent>{pendingFacebook.accounts.map(account => <SelectItem key={account.id} value={account.id}>{account.name} ({account.id}) · {account.currency}</SelectItem>)}</SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">{pendingFacebook.expiresAt ? `Access expires ${new Date(pendingFacebook.expiresAt).toLocaleDateString()}. Reconnect before that date.` : "Access has no scheduled expiry. Reconnect if access is revoked."}</p>
+                  <Button disabled={!pendingAccountId || pendingFacebookMutation.isPending} onClick={() => pendingFacebookMutation.mutate({ storeId, adAccountId: pendingAccountId })}>
+                    {pendingFacebookMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Connect selected ad account
+                  </Button>
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground mb-4">Ad spend uses the entire ad account for the selected dates. If you connect the same account to multiple stores, each includes that account's spend.</p>
               {facebookConns && facebookConns.length > 0 ? (
                 <div className="space-y-4">
                   {facebookConns.map((conn) => (
                     <div key={conn.id} className="flex items-center justify-between border rounded-lg p-4">
                       <div>
-                        <p className="text-sm font-medium">Account: {conn.adAccountId}</p>
+                        <p className="text-sm font-medium">{conn.adAccountName || "Facebook ad account"}</p>
+                        <p className="text-xs text-muted-foreground">Account: {conn.adAccountId}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {conn.tokenExpiresAt ? `${new Date(conn.tokenExpiresAt).getTime() <= Date.now() ? "Access expired" : "Access expires"} ${new Date(conn.tokenExpiresAt).toLocaleDateString()}` : conn.tokenType ? "No scheduled expiry · reconnect if access is revoked" : "Token expiry has not been verified"}
+                        </p>
                         <p className="text-sm text-muted-foreground">
                           Connected {new Date(conn.connectedAt).toLocaleDateString()}
                         </p>
@@ -296,8 +348,8 @@ export default function Connections() {
                       </Button>
                     </div>
                   ))}
-                  <Button variant="outline" onClick={handleFacebookConnect}>
-                    Add Another Account
+                  <Button variant="outline" onClick={handleFacebookConnect} disabled={facebookAuthMutation.isPending}>
+                    Reconnect or add account
                   </Button>
                 </div>
               ) : (
@@ -306,6 +358,18 @@ export default function Connections() {
                     Connect your Facebook ad account to automatically track ad spend and calculate profit.
                   </p>
                   
+                  {reusableAccounts.length > 0 && (
+                    <div className="space-y-2 border rounded-lg p-4">
+                      <Label htmlFor="existingFacebookAccount">Use an account connected to another store</Label>
+                      <Select value={existingConnectionId} onValueChange={setExistingConnectionId}>
+                        <SelectTrigger id="existingFacebookAccount"><SelectValue placeholder="Select a connected ad account" /></SelectTrigger>
+                        <SelectContent>{reusableAccounts.map(connection => <SelectItem key={connection.id} value={String(connection.id)}>{connection.adAccountName || connection.adAccountId} · {connection.storeName}</SelectItem>)}</SelectContent>
+                      </Select>
+                      <Button disabled={!existingConnectionId || existingFacebookMutation.isPending} onClick={() => existingFacebookMutation.mutate({ storeId, connectionId: Number(existingConnectionId) })}>
+                        {existingFacebookMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Connect existing ad account
+                      </Button>
+                    </div>
+                  )}
                   {!showManualFacebook ? (
                     <div className="space-y-2">
                       <Button onClick={handleFacebookConnect} disabled={facebookAuthMutation.isPending}>

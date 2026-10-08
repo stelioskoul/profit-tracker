@@ -1,3 +1,4 @@
+import { facebookJson } from "./facebook-oauth";
 /**
  * Facebook Marketing API data fetching utilities
  * Migrated from original Netlify functions
@@ -18,7 +19,6 @@ export async function fetchFacebookAdSpend(
   const accountId = adAccountId.startsWith("act_") ? adAccountId : `act_${adAccountId}`;
 
   const url = new URL(`https://graph.facebook.com/${apiVersion}/${accountId}/insights`);
-  url.searchParams.set("access_token", accessToken);
   url.searchParams.set("fields", "spend");
   url.searchParams.set(
     "time_range",
@@ -26,12 +26,7 @@ export async function fetchFacebookAdSpend(
   );
   url.searchParams.set("level", "account");
 
-  const res = await fetch(url.toString());
-  if (!res.ok) {
-    throw new Error(`Facebook insights API returned HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
+  const data = await facebookJson(`${accountId}/insights`, accessToken, Object.fromEntries(url.searchParams), apiVersion);
   let spend = 0;
 
   if (Array.isArray(data.data) && data.data.length > 0) {
@@ -42,13 +37,7 @@ export async function fetchFacebookAdSpend(
   }
 
   // Get account currency
-  const accountUrl = new URL(`https://graph.facebook.com/${apiVersion}/${accountId}`);
-  accountUrl.searchParams.set("access_token", accessToken);
-  accountUrl.searchParams.set("fields", "currency");
-
-  const accountRes = await fetch(accountUrl.toString());
-  if (!accountRes.ok) throw new Error(`Facebook account currency unavailable (HTTP ${accountRes.status})`);
-  const accountData = await accountRes.json();
+  const accountData = await facebookJson(accountId, accessToken, { fields: "currency" }, apiVersion);
   const currency = accountData.currency?.toUpperCase();
   if (!currency) throw new Error("Facebook account currency is missing");
 

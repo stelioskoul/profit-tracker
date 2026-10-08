@@ -2,7 +2,8 @@ import type { Express, Request, Response } from "express";
 import * as db from "../db";
 import { verifyOAuthState } from "../oauth-state";
 import { exchangeShopifyCode, normalizeShopDomain, verifyShopifyFinancialAccess, verifyShopifyHmac } from "../shopify-oauth";
-import { exchangeFacebookCode, exchangeForLongLivedToken, getFacebookAdAccounts } from "../facebook-oauth";
+import { exchangeFacebookCode, prepareFacebookToken, getFacebookAdAccounts } from "../facebook-oauth";
+import { stageFacebookToken } from "../facebook-pending";
 import { getSessionUserId } from "./sdk";
 
 function queryString(req: Request, key: string): string | undefined {
@@ -53,31 +54,29 @@ export function registerOAuthRoutes(app: Express) {
   });
 
   app.get("/api/oauth/facebook/callback", async (req: Request, res: Response) => {
-    const code = queryString(req, "code");
     const state = queryString(req, "state");
-    if (!code || !state) return res.status(400).json({ error: "Missing OAuth parameters" });
-
+    let storeId: number | undefined;
     try {
-      const storeId = await authorizedStore(req, state, "facebook");
+      if (!state) throw new Error("Missing OAuth state");
+      storeId = await authorizedStore(req, state, "facebook");
+      if (queryString(req, "error")) return res.redirect(302, `/store/${storeId}/connections?facebook=cancelled`);
+      const code = queryString(req, "code");
+      if (!code) throw new Error("Missing OAuth code");
       const baseUrl = process.env.APP_URL;
       if (!baseUrl) throw new Error("APP_URL is not configured");
       const redirectUri = `${baseUrl.replace(/\/$/, "")}/api/oauth/facebook/callback`;
       const shortToken = await exchangeFacebookCode(code, redirectUri);
-      const token = await exchangeForLongLivedToken(shortToken.access_token);
-      const accounts = await getFacebookAdAccounts(token.access_token);
-      if (accounts.length === 0) return res.status(400).json({ error: "No Facebook ad accounts found" });
-      const expiresAt = new Date(Date.now() + (token.expires_in || 5184000) * 1000);
-      await db.upsertFacebookConnection({
-        storeId,
-        adAccountId: accounts[0].id,
-        accessToken: token.access_token,
-        tokenExpiresAt: expiresAt,
-        apiVersion: "v25.0",
-        timezoneOffset: -300,
-      });
-      return res.redirect(302, `/store/${storeId}/connections`);
+      const token = await prepareFacebookToken(shortToken.access_token);
+      const accounts = await getFacebookAdAccounts(token.accessToken);
+      if (accounts.length === 0) return res.redirect(302, `/store/${storeId}/connections?facebook=no_accounts`);
+      const userId = await getSessionUserId(req);
+      if (!userId) throw new Error("OAuth session expired");
+      await stageFacebookToken(res, req, userId, storeId, token.accessToken);
+      // The user chooses the account after login. Never silently attach accounts[0].
+      return res.redirect(302, `/store/${storeId}/connections?facebook=select`);
     } catch (error) {
-      console.error("[Facebook OAuth] Callback rejected:", error instanceof Error ? error.message : String(error));
+      console.error("[Facebook OAuth] Callback rejected:", error instanceof Error ? error.message : "Invalid callback");
+      if (storeId) return res.redirect(302, `/store/${storeId}/connections?facebook=failed`);
       return res.status(403).json({ error: "Facebook connection failed; sign in and retry" });
     }
   });

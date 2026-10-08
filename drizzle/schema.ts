@@ -107,6 +107,8 @@ export const facebookConnections = pgTable(
       .notNull()
       .references(() => stores.id, { onDelete: "cascade" }),
     adAccountId: varchar("adAccountId", { length: 255 }).notNull(),
+    adAccountName: varchar("adAccountName", { length: 255 }),
+    tokenType: varchar("tokenType", { length: 32 }),
     accessToken: text("accessToken").notNull(),
     tokenExpiresAt: timestamp("tokenExpiresAt", { withTimezone: true }),
     apiVersion: varchar("apiVersion", { length: 20 }).default("v25.0"),

@@ -5,7 +5,7 @@
 - **Financial-audit production deployment, 2 October 2026:** `dpl_4vjyNZd57t3Q7UsqysTAJWBczjgB`
 - **GitHub:** [stelioskoul/profit-tracker](https://github.com/stelioskoul/profit-tracker) (renamed from `beprofit-alternative`)
 
-The full React/Express/tRPC app uses Beprofit's Supabase Postgres database. The production release was uploaded directly to Vercel, not deployed from GitHub. Vercel serves `public/**` via its CDN and runs the generated `server.cjs` as an Express Function. **Pushing or merging this PR does not itself redeploy production.** This branch preserves the audited production source and its Vercel adapter; it does not change the project's repository connection, environment variables or deployment settings.
+The full React/Express/tRPC app uses Supabase Postgres. The audited 2 October release was uploaded directly to Vercel. The project is now connected to GitHub: branch pushes create previews and merging to `main` deploys production. `vercel.json` runs `pnpm build:vercel`, which builds React, copies generated static assets to `public/`, and bundles the audited Express adapter into `dist/vercel-api.cjs`. The root `app.cjs` exports that bundle; Vercel serves `public/**` through its CDN. Verify a branch preview before merging deployment changes.
 
 ## Verification and limits
 
@@ -44,6 +44,10 @@ node scripts/build-vercel.mjs
 
 If a generated root `public/` already exists, replace only that generated output after checking it contains no user-authored assets. The bundler refuses to overwrite an unrecognized `vercel-package/`; a recognized prior generated package is regenerated safely. Deploy **the generated `vercel-package/` directory** to the existing Vercel project with its protected settings. Do not commit this output, `.env` files or tokens.
 
-The existing standalone `pnpm build`/`pnpm start` and Docker workflows remain available. The root `server.ts` adapter is only for Vercel; it does not own an HTTP listener. Merely connecting the raw source repository for auto-deploy is not equivalent to deploying the packaged app: arrange and verify the packaging/static-output build strategy before enabling Git-connected deployment. This PR does not enable auto-deploy.
+The existing standalone `pnpm build`/`pnpm start` and Docker workflows remain available. The `vercel/server.ts` adapter is only for Vercel; it does not own an HTTP listener. The Git deployment build bundles this adapter before Vercel traces `app.cjs`, avoiding extensionless TypeScript imports and preserving the SPA/API fallback guards. The separate `scripts/build-vercel.mjs` workflow remains available for generating a standalone upload package.
 
 Sources: [Vercel Express](https://vercel.com/docs/frameworks/backend/express), [Vercel Node.js Functions](https://vercel.com/docs/functions/runtimes/node-js).
+
+## Installed Shopify app connections
+
+For the owner account, `SHOPIFY_CLIENT_CREDENTIALS` maps each installed app's permanent shop domain to its server-only client credentials, owner user ID and display label. Connections appear in the store selector only for that account. The backend renews Shopify's short-lived client-credentials token before expiry, verifies orders/disputes/payout access before saving, and encrypts saved provider tokens. Connection setup synchronizes the store currency and IANA timezone. These apps need `read_shopify_payments_payouts`; the new store additionally needs Shopify-approved `read_all_orders` for reporting periods older than 60 days.

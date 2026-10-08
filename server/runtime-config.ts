@@ -1,5 +1,6 @@
 import { getSessionSecret } from "./_core/sdk";
 import { validateTokenEncryptionKey } from "./token-crypto";
+import { readShopifyClientCredentials } from "./shopify-client-credentials";
 
 export function validateRuntimeConfiguration(): void {
   const databaseUrl = process.env.DATABASE_URL;
@@ -24,6 +25,7 @@ export function validateRuntimeConfiguration(): void {
 
   getSessionSecret();
   validateTokenEncryptionKey();
+  readShopifyClientCredentials();
 
   const origin = process.env.APP_URL;
   if (origin) {

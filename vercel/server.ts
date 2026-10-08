@@ -1,13 +1,13 @@
 import "dotenv/config";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
-import indexHtml from "./public/index.html";
-import { users } from "./drizzle/schema";
-import { getDb } from "./server/db";
-import { registerOAuthRoutes } from "./server/_core/oauth";
-import { createContext } from "./server/_core/context";
-import { appRouter } from "./server/routers";
-import { validateRuntimeConfiguration } from "./server/runtime-config";
+import indexHtml from "../public/index.html";
+import { users } from "../drizzle/schema";
+import { getDb } from "../server/db";
+import { registerOAuthRoutes } from "../server/_core/oauth";
+import { createContext } from "../server/_core/context";
+import { appRouter } from "../server/routers";
+import { validateRuntimeConfiguration } from "../server/runtime-config";
 
 // Vercel owns the HTTP listener and serves files in public/ from its CDN.
 // Never import server/_core/index here: its standalone listener is for Manus Preview.

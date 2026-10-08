@@ -25,6 +25,7 @@ The server reads the following values **only from a protected environment/secret
 | `TOKEN_ENCRYPTION_KEY` | A base64-encoded 32-byte secret for provider tokens. Preserve this key across deploys. |
 | `APP_URL` | Public HTTPS origin of the newly deployed app, without a trailing slash; local testing uses `http://localhost:3000`. |
 | `SHOPIFY_CLIENT_ID`, `SHOPIFY_CLIENT_SECRET` | Needed to authorize Shopify shops with the new callback URL. |
+| `SHOPIFY_CLIENT_CREDENTIALS` | Optional server-only JSON map of installed `.myshopify.com` domains to `{userId, label, clientId, clientSecret}`. Bind each entry to its owning Profit Tracker account. The Connections screen offers those stores only to that account; client-credentials tokens are cached and renewed before their 24-hour expiry. Store this value encrypted in the hosting environment, never in frontend variables or source control. Manual token connections remain supported. |
 | `FACEBOOK_APP_ID`, `FACEBOOK_APP_SECRET` | Needed for Meta ad-account OAuth. |
 | `PORT` | Server listener, default `3000`. |
 

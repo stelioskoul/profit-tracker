@@ -1,4 +1,4 @@
-import { eq, and } from "drizzle-orm";
+import { eq, and, getTableColumns } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { 
@@ -24,6 +24,7 @@ import {
   InsertProcessingFeesConfig,
 } from "../drizzle/schema";
 import { decryptToken, encryptToken } from "./token-crypto";
+import { getConfiguredShopifyToken } from "./shopify-client-credentials";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 let _client: ReturnType<typeof postgres> | null = null;
@@ -224,9 +225,13 @@ export async function getShopifyConnectionByStoreId(storeId: number) {
   const db = await getDb();
   if (!db) return undefined;
 
-  const result = await db.select().from(shopifyConnections).where(eq(shopifyConnections.storeId, storeId)).limit(1);
-  const connection = result[0];
-  return connection ? { ...connection, accessToken: decryptToken(connection.accessToken) } : undefined;
+  const result = await db.select({ ...getTableColumns(shopifyConnections), ownerId: stores.userId })
+    .from(shopifyConnections).innerJoin(stores, eq(stores.id, shopifyConnections.storeId))
+    .where(eq(shopifyConnections.storeId, storeId)).limit(1);
+  if (!result[0]) return undefined;
+  const { ownerId, ...connection } = result[0];
+  const renewed = await getConfiguredShopifyToken(connection.shopDomain, ownerId);
+  return { ...connection, accessToken: renewed?.accessToken ?? decryptToken(connection.accessToken), scopes: renewed?.scopes ?? connection.scopes };
 }
 
 export async function deleteShopifyConnection(storeId: number) {

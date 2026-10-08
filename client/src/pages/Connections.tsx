@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { getLoginUrl } from "@/const";
 import { trpc } from "@/lib/trpc";
 import { ArrowLeft, CheckCircle, Loader2, XCircle } from "lucide-react";
@@ -15,7 +16,9 @@ export default function Connections() {
   const storeId = parseInt(id || "0");
   const [, setLocation] = useLocation();
   const { isAuthenticated, loading } = useAuth();
+  const utils = trpc.useUtils();
   const [shopDomain, setShopDomain] = useState("");
+  const [configuredShop, setConfiguredShop] = useState("");
   const [showManualShopify, setShowManualShopify] = useState(false);
   const [shopifyToken, setShopifyToken] = useState("");
   const [showManualFacebook, setShowManualFacebook] = useState(false);
@@ -26,6 +29,16 @@ export default function Connections() {
     { storeId },
     { enabled: isAuthenticated && storeId > 0 }
   );
+
+  const { data: availableShops } = trpc.shopify.availableStores.useQuery(undefined, { enabled: isAuthenticated });
+  const configuredShopifyMutation = trpc.shopify.connectConfigured.useMutation({
+    onSuccess: () => {
+      toast.success("Shopify connected successfully");
+      refetchShopify();
+      utils.stores.getById.invalidate({ id: storeId });
+    },
+    onError: error => toast.error(error.message),
+  });
 
   const { data: facebookConns, refetch: refetchFacebook } = trpc.facebook.getConnections.useQuery(
     { storeId },
@@ -170,6 +183,22 @@ export default function Connections() {
                         Beprofit needs its own Shopify connection; the separate Manus Shopify plugin does not connect this app automatically.
                         The app token must have read_orders, read_shopify_payments_disputes and read_shopify_payments_payouts.
                       </p>
+                      {!!availableShops?.length && (
+                        <div className="space-y-3">
+                          <Label htmlFor="configuredShop">Shopify Store</Label>
+                          <Select value={configuredShop} onValueChange={setConfiguredShop}>
+                            <SelectTrigger id="configuredShop"><SelectValue placeholder="Select your Shopify store" /></SelectTrigger>
+                            <SelectContent>
+                              {availableShops.map(shop => <SelectItem key={shop.shopDomain} value={shop.shopDomain}>{shop.label} ({shop.shopDomain})</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                          <Button className="w-full" disabled={!configuredShop || configuredShopifyMutation.isPending}
+                            onClick={() => configuredShopifyMutation.mutate({ storeId, shopDomain: configuredShop })}>
+                            {configuredShopifyMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                            Connect Shopify
+                          </Button>
+                        </div>
+                      )}
                       <Button variant="outline" onClick={() => setShowManualShopify(true)} className="w-full">
                         Enter Admin API Token
                       </Button>

@@ -11,6 +11,7 @@ import { useParams } from "wouter";
 import { toast } from "sonner";
 
 const TIMEZONES = [
+  { value: "America/Bogota", label: "Bogota (UTC-05:00)" },
   { value: "America/New_York", label: "New York (EST/EDT)" },
   { value: "America/Los_Angeles", label: "Los Angeles (PST/PDT)" },
   { value: "Europe/Athens", label: "Greece (EET/EEST)" },

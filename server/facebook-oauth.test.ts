@@ -17,7 +17,8 @@ describe("Facebook login and token verification", () => {
     vi.stubEnv("FACEBOOK_LOGIN_CONFIG_ID", "67890");
     url = new URL(getFacebookAuthUrl("https://example.com/callback", "state"));
     expect(url.searchParams.get("config_id")).toBe("67890");
-    expect(url.searchParams.get("scope")).toBeNull();
+    expect(url.searchParams.get("scope")).toBe("ads_read");
+    expect(url.searchParams.get("auth_type")).toBe("rerequest");
     expect(url.searchParams.has("client_secret")).toBe(false);
   });
   it("preserves a verified non-expiring system-user token without exchanging it", async () => {
@@ -29,6 +30,20 @@ describe("Facebook login and token verification", () => {
     const expiry = Math.floor(Date.now()/1000) + 86400;
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(info({ expires_at: expiry + 100000, data_access_expires_at: expiry }))));
     expect((await inspectFacebookToken("fixture")).expiresAt?.getTime()).toBe(expiry*1000);
+  });
+  it("recognizes ads_read when Meta reports it as an asset-specific granular grant", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(info({ scopes: [], granular_scopes: [{ scope: "ads_read", target_ids: ["123"] }] }))));
+    expect(await inspectFacebookToken("fixture")).toEqual({ type: "SYSTEM_USER", expiresAt: null });
+  });
+  it("rejects an unrelated granular grant and only logs safe permission names", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(info({ scopes: ["public_profile", "secret-value"], granular_scopes: [{ scope: "pages_read_engagement", target_ids: ["private-asset"] }], access_token: "private-provider-token" }))));
+      await expect(inspectFacebookToken("private-input-token")).rejects.toThrow("did not grant ads_read");
+      const log = JSON.stringify(warn.mock.calls);
+      expect(log).toContain("public_profile");
+      expect(log).not.toMatch(/private-|secret-value/);
+    } finally { warn.mockRestore(); }
   });
   it.each([{is_valid:false}, {app_id:"different"}, {scopes:[]}, {expires_at:1}, {expires_at:undefined}])("rejects invalid, mismatched, unpermitted or expired tokens: %j", async overrides => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(json(info(overrides))));

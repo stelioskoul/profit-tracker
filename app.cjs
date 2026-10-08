@@ -1,2 +1,6 @@
-// The build bundles the proven Vercel adapter and its SPA HTML before deployment.
-module.exports = require("./dist/vercel-api.cjs");
+const express = require("express");
+const app = express();
+app.disable("x-powered-by");
+// The build bundles the audited adapter and its SPA HTML before deployment.
+app.use(require("./dist/vercel-api.cjs"));
+module.exports = app;

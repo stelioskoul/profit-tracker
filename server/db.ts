@@ -258,6 +258,8 @@ export async function upsertFacebookConnection(connection: InsertFacebookConnect
     set: {
       accessToken,
       tokenExpiresAt: connection.tokenExpiresAt,
+      adAccountName: connection.adAccountName,
+      tokenType: connection.tokenType,
       apiVersion: connection.apiVersion,
       timezoneOffset: connection.timezoneOffset,
       connectedAt: new Date(),
@@ -274,6 +276,15 @@ export async function getFacebookConnectionsByStoreId(storeId: number) {
     ...connection,
     accessToken: decryptToken(connection.accessToken),
   }));
+}
+
+export async function getFacebookConnectionsForUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select({ id: facebookConnections.id, storeId: stores.id, storeName: stores.name,
+    adAccountId: facebookConnections.adAccountId, adAccountName: facebookConnections.adAccountName,
+    tokenExpiresAt: facebookConnections.tokenExpiresAt, tokenType: facebookConnections.tokenType })
+    .from(facebookConnections).innerJoin(stores, eq(facebookConnections.storeId, stores.id)).where(eq(stores.userId, userId));
 }
 
 export async function getFacebookConnectionById(connectionId: number) {

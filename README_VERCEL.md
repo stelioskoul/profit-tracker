@@ -51,3 +51,15 @@ Sources: [Vercel Build Output API](https://vercel.com/docs/build-output-api), [F
 ## Installed Shopify app connections
 
 For the owner account, `SHOPIFY_CLIENT_CREDENTIALS` maps each installed app's permanent shop domain to its server-only client credentials, owner user ID and display label. Connections appear in the store selector only for that account. The backend renews Shopify's short-lived client-credentials token before expiry, verifies orders/disputes/payout access before saving, and encrypts saved provider tokens. Connection setup synchronizes the store currency and IANA timezone. These apps need `read_shopify_payments_payouts`; the new store additionally needs Shopify-approved `read_all_orders` for reporting periods older than 60 days.
+
+## Facebook Ads connection
+
+Configure server-only `FACEBOOK_APP_ID`, `FACEBOOK_APP_SECRET`, and `FACEBOOK_LOGIN_CONFIG_ID`. In Meta's Facebook Login for Business settings, retain HTTPS and strict redirect matching, enable web/client OAuth, and register the exact Facebook callback above. The Login configuration should request `ads_read` and Ad accounts with only the `ANALYZE` task. A system-user configuration with no scheduled expiry supports continuous reporting; the business or Meta can still revoke it. Do not request ad-management permissions for this reporting app.
+
+The OAuth callback stages an encrypted token in a signed, HttpOnly, ten-minute cookie bound to the authenticated user and store. The Connections page lists granted ad accounts and requires an explicit selection; the server verifies Insights access before saving. The same owner's other store profiles can reuse an existing account connection after another live access check. Token values are not returned to the browser.
+
+Token inspection checks the app ID, `ads_read`, validity, and actual token/data-access expiry. Short-lived user tokens are exchanged for long-lived tokens; system-user tokens are used directly. Manual connections use the same inspection and never invent a one-year expiry. The connection screen shows the actual expiration or no-scheduled-expiry verdict and provides a reconnect action. Expired/revoked access produces a reconnect error instead of silently reporting zero spend.
+
+Apply `supabase/migrations/20261008160000_facebook_connection_metadata.sql` before deploying this change. It adds account display name and token type to the existing protected connections table.
+
+Spend is account-wide for the selected dates. Connecting the same account to multiple stores makes each include that full spend; campaign allocation is a separate feature.

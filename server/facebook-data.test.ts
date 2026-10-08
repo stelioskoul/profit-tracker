@@ -19,6 +19,6 @@ describe("Facebook ad-account currency validation", () => {
   it("rejects a missing currency rather than silently converting USD spend as EUR", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string) =>
       input.includes("insights") ? response({ data: [{ spend: "10" }] }) : response({ error: "denied" }, 403)));
-    await expect(fetchFacebookAdSpend("123", "token", range)).rejects.toThrow("currency unavailable (HTTP 403)");
+    await expect(fetchFacebookAdSpend("123", "token", range)).rejects.toThrow("Facebook API request failed (HTTP 403)");
   });
 });

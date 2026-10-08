@@ -7,7 +7,8 @@ import { z } from "zod";
 import * as db from "./db";
 import { getShopifyAuthUrl, normalizeShopDomain, verifyShopifyFinancialAccess } from "./shopify-oauth";
 import { configuredShopifyStoresForUser, getConfiguredShopifyToken } from "./shopify-client-credentials";
-import { getFacebookAuthUrl, getFacebookAdAccounts } from "./facebook-oauth";
+import { getFacebookAuthUrl, prepareFacebookToken, getFacebookAdAccounts, verifyFacebookAdAccount, FACEBOOK_API_VERSION } from "./facebook-oauth";
+import { readPendingFacebookToken, clearPendingFacebookToken } from "./facebook-pending";
 import { createOAuthState } from "./oauth-state";
 import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions, type DisputeSummary } from "./shopify-data";
 import { fetchFacebookAdSpend } from "./facebook-data";
@@ -17,6 +18,18 @@ import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
 import { assertOrderHistoryAccess } from "./shopify-order-access";
 import { getEurUsdRate, getCachedRate } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
+
+async function saveVerifiedFacebookConnection(storeId: number, accessToken: string, adAccountId: string) {
+  const token = await prepareFacebookToken(accessToken);
+  const account = await verifyFacebookAdAccount(token.accessToken, adAccountId);
+  const offset = account.timezone_offset_hours_utc;
+  if (offset !== undefined && (typeof offset !== "number" || !Number.isFinite(offset))) throw new Error("Facebook returned an invalid account timezone offset.");
+  await db.upsertFacebookConnection({
+    storeId, adAccountId: account.id, adAccountName: account.name, accessToken: token.accessToken,
+    tokenType: token.type, tokenExpiresAt: token.expiresAt, apiVersion: FACEBOOK_API_VERSION,
+    timezoneOffset: offset === undefined ? null : Math.round(offset * 60),
+  });
+}
 
 export const appRouter = router({
     // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
@@ -490,40 +503,48 @@ export const appRouter = router({
         return { authUrl };
       }),
     
-    connectManual: protectedProcedure
-      .input(
-        z.object({
-          storeId: z.number(),
-          accessToken: z.string(),
-          adAccountId: z.string(),
-        })
-      )
+    pendingAccounts: protectedProcedure
+      .input(z.object({ storeId: z.number() }))
+      .query(async ({ ctx, input }) => {
+        const store = await db.getStoreById(input.storeId);
+        if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
+        const accessToken = await readPendingFacebookToken(ctx.req, ctx.user.id, store.id);
+        if (!accessToken) return null;
+        const token = await prepareFacebookToken(accessToken);
+        const accounts = await getFacebookAdAccounts(token.accessToken);
+        return { accounts: accounts.map(({ id, name, currency }) => ({ id, name, currency })), tokenType: token.type, expiresAt: token.expiresAt };
+      }),
+
+    connectPending: protectedProcedure
+      .input(z.object({ storeId: z.number(), adAccountId: z.string() }))
       .mutation(async ({ ctx, input }) => {
         const store = await db.getStoreById(input.storeId);
         if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
-        // Verify token works by fetching ad account info
-        const adAccounts = await getFacebookAdAccounts(input.accessToken);
-        const account = adAccounts.find((acc: any) => acc.id === input.adAccountId);
-        
-        if (!account) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: "Ad account not found or token invalid",
-          });
-        }
+        const accessToken = await readPendingFacebookToken(ctx.req, ctx.user.id, store.id);
+        if (!accessToken) throw new TRPCError({ code: "BAD_REQUEST", message: "Facebook login expired. Click Connect with Facebook OAuth again." });
+        await saveVerifiedFacebookConnection(store.id, accessToken, input.adAccountId);
+        clearPendingFacebookToken(ctx.res, ctx.req);
+        return { success: true };
+      }),
 
-        // Save connection with a far-future expiry (manual tokens don't expire easily)
-        const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // 1 year
+    availableConnections: protectedProcedure.query(({ ctx }) => db.getFacebookConnectionsForUser(ctx.user.id)),
 
-        await db.upsertFacebookConnection({
-          storeId: input.storeId,
-          adAccountId: input.adAccountId,
-          accessToken: input.accessToken,
-          tokenExpiresAt: expiresAt,
-          apiVersion: "v25.0",
-          timezoneOffset: -300,
-        });
+    connectExisting: protectedProcedure
+      .input(z.object({ storeId: z.number(), connectionId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        const [store, connection] = await Promise.all([db.getStoreById(input.storeId), db.getFacebookConnectionById(input.connectionId)]);
+        const sourceStore = connection && await db.getStoreById(connection.storeId);
+        if (!store || store.userId !== ctx.user.id || !sourceStore || sourceStore.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
+        await saveVerifiedFacebookConnection(store.id, connection.accessToken, connection.adAccountId);
+        return { success: true };
+      }),
 
+    connectManual: protectedProcedure
+      .input(z.object({ storeId: z.number(), accessToken: z.string().min(1).max(4096), adAccountId: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        const store = await db.getStoreById(input.storeId);
+        if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
+        await saveVerifiedFacebookConnection(store.id, input.accessToken.trim(), input.adAccountId);
         return { success: true };
       }),
     getConnections: protectedProcedure
@@ -539,6 +560,8 @@ export const appRouter = router({
         return connections.map((conn) => ({
           id: conn.id,
           adAccountId: conn.adAccountId,
+          adAccountName: conn.adAccountName,
+          tokenType: conn.tokenType,
           connectedAt: conn.connectedAt,
           lastSyncAt: conn.lastSyncAt,
           tokenExpiresAt: conn.tokenExpiresAt,

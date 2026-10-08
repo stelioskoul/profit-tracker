@@ -5,7 +5,7 @@
 - **Financial-audit production deployment, 2 October 2026:** `dpl_4vjyNZd57t3Q7UsqysTAJWBczjgB`
 - **GitHub:** [stelioskoul/profit-tracker](https://github.com/stelioskoul/profit-tracker) (renamed from `beprofit-alternative`)
 
-The full React/Express/tRPC app uses Supabase Postgres. The audited 2 October release was uploaded directly to Vercel. The project is now connected to GitHub: branch pushes create previews and merging to `main` deploys production. `vercel.json` runs `pnpm build:vercel`, which builds React, copies generated static assets to `public/`, and bundles the audited Express adapter into `dist/vercel-api.cjs`. The root `app.cjs` exports that bundle; Vercel serves `public/**` through its CDN. Verify a branch preview before merging deployment changes.
+The full React/Express/tRPC app uses Supabase Postgres. The audited 2 October release was uploaded directly to Vercel. The project is now connected to GitHub: branch pushes create previews and merging to `main` deploys production. `vercel.json` runs `pnpm build:vercel`, which builds React, copies generated static assets to `public/`, and bundles the audited Express adapter into `dist/vercel-api.cjs`. The root `app.cjs` exports that bundle; Vercel serves `public/**` through its CDN; `outputDirectory: "public"` explicitly includes assets generated during the Git build. Verify a branch preview before merging deployment changes.
 
 ## Verification and limits
 

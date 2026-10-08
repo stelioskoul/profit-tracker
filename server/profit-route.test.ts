@@ -77,6 +77,24 @@ beforeEach(() => {
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it("groups assigned profile quantities and warns when the selected method is unset", async () => {
+    mocks.fetchShopifyOrders.mockResolvedValue([{
+      id: "42", order_number: 42, created_at: "2026-10-02T15:00:00Z", total_price: "100", currency: "USD",
+      financial_status: "paid", line_items: [{ variant_id: 1, quantity: 1 }, { variant_id: 2, quantity: 1 }],
+      shipping_address: { country: "United Kingdom", country_code: "GB" }, shipping_lines: [],
+    }]);
+    const configJson = JSON.stringify({ UK: { Standard: { 1: 8.5, 2: 13 } } });
+    mocks.getShippingConfigByStoreId.mockResolvedValue([
+      { variantId: "1", profileId: 7, configJson }, { variantId: "2", profileId: 7, configJson },
+    ]);
+    const standard = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(standard.shipping).toBe(13);
+    const orders = await mocks.fetchShopifyOrders();
+    mocks.fetchShopifyOrders.mockResolvedValue([{ ...orders[0], shipping_lines: [{ title: "Express" }] }]);
+    const express = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(express.dataQuality.warnings.join(" ")).toContain("no configured shipping cost");
+  });
+
   it("uses actual signed ledger debits and credits once, with no fixed fee per case", async () => {
     const result = await appRouter.createCaller(context()).metrics.getProfit(period);
     expect(result.disputeCases.won).toBe(1);

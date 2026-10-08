@@ -65,25 +65,8 @@ export async function generateCogsTemplate(storeId: number): Promise<string> {
   const cogsMap = new Map(cogsConfigs.map((c: any) => [c.variantId, c.cogsValue]));
   
   // Get shipping profile assignments
-  const { shippingConfig } = await import("../drizzle/schema");
-  const { eq } = await import("drizzle-orm");
-  const database = await db.getDb();
-  if (!database) throw new Error("Database not available");
-  
-  const shippingAssignments = await database
-    .select()
-    .from(shippingConfig)
-    .where(eq(shippingConfig.storeId, storeId));
-  
-  const shippingMap = new Map();
-  for (const assignment of shippingAssignments) {
-    try {
-      const config = JSON.parse(assignment.configJson);
-      if (config.profileId) {
-        shippingMap.set(assignment.variantId, config.profileId);
-      }
-    } catch {}
-  }
+  const shippingAssignments = await db.getProductShippingProfilesByStoreId(storeId);
+  const shippingMap = new Map(shippingAssignments.map(assignment => [assignment.variantId, assignment.profileId]));
   
   // Get shipping profiles to map ID to name
   const profiles = await db.getShippingProfilesByStoreId(storeId);

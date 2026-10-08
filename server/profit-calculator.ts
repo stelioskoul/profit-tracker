@@ -2,20 +2,13 @@
  * Profit calculation engine
  * Migrated from original Netlify functions with multi-store support
  */
+import { shippingCountry } from "../shared/shipping-regions";
 
 interface CogsConfigMap {
   [variantId: string]: number; // variantId -> cogs value
 }
 
-interface ShippingConfigMap {
-  [variantId: string]: {
-    [shippingType: string]: {
-      [region: string]: {
-        [quantity: string]: number;
-      };
-    };
-  };
-}
+type ShippingConfigMap = Record<string, any>;
 
 interface LineItem {
   variant_id?: number | string;
@@ -24,6 +17,7 @@ interface LineItem {
   name?: string;
   quantity: number;
   price?: string | number;
+  requires_shipping?: boolean;
 }
 
 interface ShopifyOrder {
@@ -42,27 +36,14 @@ interface ShopifyOrder {
   line_items: LineItem[];
   shipping_address?: {
     country?: string;
+    country_code?: string;
   };
   shipping_lines: any[];
 }
 
 function mapCountryToRegion(country?: string | null): string | null {
-  if (!country) return null;
-  const c = country.toString().trim().toUpperCase();
-  if (!c) return null;
-  if (
-    c === "US" ||
-    c === "USA" ||
-    c === "UNITED STATES" ||
-    c === "UNITED STATES OF AMERICA"
-  ) {
-    return "USA";
-  }
-  if (c === "CA" || c === "CANADA") {
-    return "CANADA";
-  }
-  // Treat everything else as EU for shipping purposes
-  return "EU";
+  const region = shippingCountry(country);
+  return region === "US" ? "USA" : region === "CA" ? "CANADA" : region;
 }
 
 function inferShippingType(order: ShopifyOrder): string {
@@ -114,89 +95,89 @@ export function computeShippingForLineItem(
   shippingConfig: ShippingConfigMap,
   exchangeRate: number = 1.0
 ): number {
-  if (!item || !region || !shippingType) return 0;
+  if (!item) return 0;
+  return shippingPrice(item, region, shippingType, shippingConfig, exchangeRate).cost;
+}
 
-  let quantity = item.quantity || 0;
-  if (quantity <= 0) return 0;
+type ShippingPrice = { cost: number; configured: boolean };
 
+function shippingPrice(
+  item: LineItem, region: string | null, shippingType: string,
+  shippingConfig: ShippingConfigMap, exchangeRate: number,
+): ShippingPrice {
+  if (item.requires_shipping === false || item.quantity <= 0) return { cost: 0, configured: true };
   const key = getItemConfigKey(item);
-  if (!key) return 0;
-
-  let productConfig: any = shippingConfig[key];
-  if (!productConfig) return 0;
-
-  // Check if config has the new format with currency
-  let configCurrency = "USD"; // default
-  let rates: any = productConfig;
-  
-  if (productConfig.currency && productConfig.rates) {
-    configCurrency = productConfig.currency;
-    rates = productConfig.rates;
-  }
-
-  // Map region names to match new UI format (US, EU, CA)
-  let countryKey = region;
-  if (region === "USA") countryKey = "US";
-  if (region === "CANADA") countryKey = "CA";
-  
-  // Map shipping type to method name (Standard, Express)
-  let methodKey = "Standard";
-  if (shippingType === "express") methodKey = "Express";
-  
-  // New format: rates[country][method][quantity]
-  const countryConfig = rates[countryKey];
-  if (!countryConfig) return 0;
-
-  const methodConfig = countryConfig[methodKey];
-  if (!methodConfig) return 0;
-
-  const keys = Object.keys(methodConfig)
-    .map((k) => parseInt(k, 10))
-    .filter((n) => !isNaN(n) && n > 0)
-    .sort((a, b) => a - b);
-
-  if (!keys.length) return 0;
-
-  let total = 0;
-  const maxKey = keys[keys.length - 1];
-
-  // If within table range, treat as a single tier lookup.
-  if (quantity <= maxKey) {
-    const v = methodConfig[String(quantity)];
-    const num = parseFloat(String(v));
-    total = isNaN(num) ? 0 : num;
-  } else {
-    // If above table range, break into largest-available tiers greedily.
-    while (quantity > 0) {
-      let tier = keys[0];
-      for (let i = 0; i < keys.length; i++) {
-        const k = keys[i];
-        const next = keys[i + 1];
-        if (k <= quantity && (!next || next > quantity)) {
-          tier = k;
-          break;
-        }
-      }
-
-      const v = methodConfig[String(tier)];
-      const num = parseFloat(String(v));
-      if (!isNaN(num)) {
-        total += num;
-      }
-
-      quantity -= tier;
+  const config = key ? shippingConfig[key] : undefined;
+  if (!region || !config) return { cost: 0, configured: false };
+  const country = region === "USA" ? "US" : region === "CANADA" ? "CA" : region;
+  const rates = config.rates ?? config;
+  // Existing three-region profiles previously used EU prices for these destinations.
+  const countryRates = rates[country] ?? (["UK", "AU", "NZ"].includes(country) ? rates.EU : undefined);
+  const prices = countryRates?.[shippingType === "express" ? "Express" : "Standard"];
+  if (!prices) return { cost: 0, configured: false };
+  const tiers = Object.keys(prices).map(Number).filter(n => Number.isInteger(n) && n > 0).sort((a, b) => a - b);
+  if (!tiers.length) return { cost: 0, configured: false };
+  if (!Number.isInteger(item.quantity)) throw new Error("Invalid shipping quantity");
+  const quantities: number[] = [];
+  if (item.quantity <= tiers[tiers.length - 1]) quantities.push(item.quantity);
+  else {
+    // Preserve the existing largest-tier decomposition for orders above the table range.
+    let remaining = item.quantity;
+    while (remaining > 0) {
+      const tier = [...tiers].reverse().find(n => n <= remaining);
+      if (!tier) return { cost: 0, configured: false };
+      quantities.push(tier);
+      remaining -= tier;
     }
   }
-
-  // The dashboard reports USD; mixing another currency as-is would be false.
-  if (configCurrency === "EUR") {
-    if (!Number.isFinite(exchangeRate) || exchangeRate <= 0) throw new Error("Invalid EUR/USD rate");
-    total *= exchangeRate;
-  } else if (configCurrency !== "USD") {
-    throw new Error(`Unsupported shipping cost currency: ${configCurrency}`);
+  let cost = 0;
+  for (const quantity of quantities) {
+    const value = prices[String(quantity)];
+    if (value === undefined || value === null || value === "") return { cost: 0, configured: false };
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) throw new Error("Invalid configured shipping cost");
+    cost += amount;
   }
+  const currency = (config.currency ?? "USD").toUpperCase();
+  if (currency === "EUR") {
+    if (!Number.isFinite(exchangeRate) || exchangeRate <= 0) throw new Error("Invalid EUR/USD rate");
+    cost *= exchangeRate;
+  } else if (currency !== "USD") throw new Error(`Unsupported shipping cost currency: ${currency}`);
+  return { cost, configured: true };
+}
 
-  return total;
+export function computeShippingForOrderItems(
+  items: LineItem[], region: string | null, shippingType: string,
+  shippingConfig: ShippingConfigMap, exchangeRate: number = 1,
+): ShippingPrice[] {
+  const result = items.map(() => ({ cost: 0, configured: true }));
+  const groups = new Map<string, number[]>();
+  items.forEach((item, index) => {
+    if (item.requires_shipping === false || item.quantity <= 0) return;
+    const key = getItemConfigKey(item);
+    const profileId = key ? shippingConfig[key]?.profileId : undefined;
+    // Direct variant configs retain their existing per-line behavior.
+    const group = profileId == null ? `line:${index}` : `profile:${profileId}`;
+    groups.set(group, [...(groups.get(group) ?? []), index]);
+  });
+  for (const indexes of Array.from(groups.values())) {
+    const quantity = indexes.reduce((sum, index) => sum + items[index].quantity, 0);
+    const price = shippingPrice({ ...items[indexes[0]], quantity }, region, shippingType, shippingConfig, exchangeRate);
+    let allocated = 0;
+    indexes.forEach((index, position) => {
+      const cost = position === indexes.length - 1 ? price.cost - allocated : price.cost * items[index].quantity / quantity;
+      result[index] = { cost, configured: price.configured };
+      allocated += cost;
+    });
+  }
+  return result;
+}
+
+interface EnrichedLineItem extends LineItem {
+  price: number;
+  cogs: number;
+  shippingCost: number;
+  shippingCostConfigured: boolean;
 }
 
 export interface ProcessedOrder {
@@ -217,7 +198,7 @@ export interface ProcessedOrder {
   profit: number; // Added: total - cogs - shippingCost - processingFees
   shippingType: string;
   region: string | null;
-  items: LineItem[];
+  items: EnrichedLineItem[];
 }
 
 export function processOrders(
@@ -262,18 +243,20 @@ export function processOrders(
         ? [order.customer.first_name, order.customer.last_name].filter(Boolean).join(" ")
         : "Guest";
 
-    const region = mapCountryToRegion(shippingCountry);
+    const region = mapCountryToRegion(order.shipping_address?.country_code || shippingCountry);
     const shippingType = inferShippingType(order);
 
     let orderCogs = 0;
     let orderShipping = 0;
 
     const lineItems = order.line_items || [];
-    const enrichedLineItems = [];
+    const shippingPrices = computeShippingForOrderItems(lineItems, region, shippingType, shippingConfig, exchangeRate);
+    const enrichedLineItems: EnrichedLineItem[] = [];
     
-    for (const item of lineItems) {
+    for (let index = 0; index < lineItems.length; index++) {
+      const item = lineItems[index];
       const itemCogs = computeCogsForLineItem(item, cogsConfig);
-      const itemShipping = region ? computeShippingForLineItem(item, region, shippingType, shippingConfig, exchangeRate) : 0;
+      const itemShipping = shippingPrices[index].cost;
       
       orderCogs += itemCogs;
       orderShipping += itemShipping;
@@ -285,6 +268,7 @@ export function processOrders(
         price: itemPrice,
         cogs: itemCogs,
         shippingCost: itemShipping,
+        shippingCostConfigured: shippingPrices[index].configured,
       });
     }
 

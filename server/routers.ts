@@ -773,7 +773,7 @@ export const appRouter = router({
           const shippingMap: Record<string, any> = {};
           for (const config of shippingConfigs) {
             try {
-              shippingMap[config.variantId] = JSON.parse(config.configJson || "{}");
+              shippingMap[config.variantId] = { ...JSON.parse(config.configJson || "{}"), profileId: config.profileId ?? null };
             } catch {
               throw new Error("A stored shipping-cost configuration is invalid; profit cannot be verified");
             }
@@ -795,11 +795,11 @@ export const appRouter = router({
             for (const item of order.items) {
               const key = String(item.variant_id ?? item.product_id ?? item.title ?? item.name ?? "");
               if (!Object.prototype.hasOwnProperty.call(cogsMap, key)) missingCogs++;
-              if (order.region && !Object.prototype.hasOwnProperty.call(shippingMap, key)) missingShipping++;
+              if (item.shippingCostConfigured === false) missingShipping++;
             }
           }
           if (missingCogs) warnings.push(`${missingCogs} line items have no configured COGS; their actual product cost is not included.`);
-          if (missingShipping) warnings.push(`${missingShipping} line items have no configured shipping profile; verify actual fulfillment costs.`);
+          if (missingShipping) warnings.push(`${missingShipping} line items have no configured shipping cost for their destination, method, or quantity; verify actual fulfillment costs.`);
           const cancelledUnfulfilled = orders.filter(order =>
             order.cancelled_at && order.fulfillment_status !== "fulfilled" &&
             !order.test && ["paid", "partially_refunded", "refunded"].includes(order.financial_status || "")
@@ -1227,7 +1227,7 @@ export const appRouter = router({
         const shippingMap: Record<string, any> = {};
         for (const config of shippingConfigList) {
           try {
-            shippingMap[config.variantId] = JSON.parse(config.configJson);
+            shippingMap[config.variantId] = { ...JSON.parse(config.configJson), profileId: config.profileId ?? null };
           } catch {
             throw new Error("Invalid configured shipping cost");
           }

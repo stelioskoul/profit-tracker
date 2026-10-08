@@ -6,6 +6,7 @@ import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import * as db from "./db";
 import { getShopifyAuthUrl, normalizeShopDomain } from "./shopify-oauth";
+import { configuredShopifyStoresForUser, getConfiguredShopifyToken } from "./shopify-client-credentials";
 import { getFacebookAuthUrl, getFacebookAdAccounts } from "./facebook-oauth";
 import { createOAuthState } from "./oauth-state";
 import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions } from "./shopify-data";
@@ -262,6 +263,32 @@ export const appRouter = router({
   }),
 
   shopify: router({
+    availableStores: protectedProcedure.query(({ ctx }) => configuredShopifyStoresForUser(ctx.user.id)),
+
+    connectConfigured: protectedProcedure
+      .input(z.object({ storeId: z.number(), shopDomain: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        const store = await db.getStoreById(input.storeId);
+        if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
+        const domain = normalizeShopDomain(input.shopDomain);
+        const token = await getConfiguredShopifyToken(domain, ctx.user.id);
+        if (!token) throw new TRPCError({ code: "FORBIDDEN", message: "This Shopify store is not configured for your account" });
+        const response = await fetch(`https://${domain}/admin/api/2026-07/shop.json`, {
+          headers: { "X-Shopify-Access-Token": token.accessToken }, redirect: "error", signal: AbortSignal.timeout(15_000),
+        });
+        if (!response.ok) throw new TRPCError({ code: "BAD_REQUEST", message: "Unable to verify the Shopify store" });
+        const { shop } = await response.json();
+        if (!shop || shop.myshopify_domain !== domain) throw new TRPCError({ code: "BAD_REQUEST", message: "Shopify store identity does not match" });
+        const timezone = String(shop.iana_timezone);
+        const offsetName = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" })
+          .formatToParts(new Date()).find(part => part.type === "timeZoneName")?.value;
+        const offset = offsetName?.match(/^GMT([+-])(\d{2}):(\d{2})$/);
+        const timezoneOffset = offset ? (offset[1] === "+" ? 1 : -1) * (Number(offset[2]) * 60 + Number(offset[3])) : 0;
+        await db.upsertShopifyConnection({ storeId: input.storeId, shopDomain: domain, accessToken: token.accessToken, scopes: token.scopes, apiVersion: "2026-07" });
+        await db.updateStore(store.id, { currency: shop.currency, timezone, timezoneOffset });
+        return { success: true };
+      }),
+
     getAuthUrl: protectedProcedure
       .input(z.object({ storeId: z.number(), shop: z.string() }))
       .mutation(async ({ ctx, input }) => {

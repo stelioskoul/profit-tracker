@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { getLoginUrl } from "@/const";
 import { trpc } from "@/lib/trpc";
 import { ArrowLeft, CheckCircle, Loader2, XCircle } from "lucide-react";
@@ -16,6 +17,7 @@ export default function Connections() {
   const [, setLocation] = useLocation();
   const { isAuthenticated, loading } = useAuth();
   const [shopDomain, setShopDomain] = useState("");
+  const [configuredShop, setConfiguredShop] = useState("");
   const [showManualShopify, setShowManualShopify] = useState(false);
   const [shopifyToken, setShopifyToken] = useState("");
   const [showManualFacebook, setShowManualFacebook] = useState(false);
@@ -26,6 +28,15 @@ export default function Connections() {
     { storeId },
     { enabled: isAuthenticated && storeId > 0 }
   );
+
+  const { data: availableShops } = trpc.shopify.availableStores.useQuery(undefined, { enabled: isAuthenticated });
+  const configuredShopifyMutation = trpc.shopify.connectConfigured.useMutation({
+    onSuccess: () => {
+      toast.success("Shopify connected successfully");
+      refetchShopify();
+    },
+    onError: error => toast.error(error.message),
+  });
 
   const { data: facebookConns, refetch: refetchFacebook } = trpc.facebook.getConnections.useQuery(
     { storeId },
@@ -169,6 +180,22 @@ export default function Connections() {
                       <p className="text-sm text-muted-foreground">
                         Connect your Shopify store to track orders, products, and revenue.
                       </p>
+                      {!!availableShops?.length && (
+                        <div className="space-y-3">
+                          <Label htmlFor="configuredShop">Shopify Store</Label>
+                          <Select value={configuredShop} onValueChange={setConfiguredShop}>
+                            <SelectTrigger id="configuredShop"><SelectValue placeholder="Select your Shopify store" /></SelectTrigger>
+                            <SelectContent>
+                              {availableShops.map(shop => <SelectItem key={shop.shopDomain} value={shop.shopDomain}>{shop.label} ({shop.shopDomain})</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                          <Button className="w-full" disabled={!configuredShop || configuredShopifyMutation.isPending}
+                            onClick={() => configuredShopifyMutation.mutate({ storeId, shopDomain: configuredShop })}>
+                            {configuredShopifyMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                            Connect Shopify
+                          </Button>
+                        </div>
+                      )}
                       <Button variant="outline" onClick={() => setShowManualShopify(true)} className="w-full">
                         Enter Admin API Token
                       </Button>

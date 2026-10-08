@@ -9,6 +9,7 @@ describe("server startup configuration", () => {
     vi.stubEnv("APP_URL", undefined);
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("SHOPIFY_CLIENT_ID", undefined);
+    vi.stubEnv("SHOPIFY_CLIENT_CREDENTIALS", undefined);
     vi.stubEnv("FACEBOOK_APP_ID", undefined);
   });
   afterEach(() => vi.unstubAllEnvs());

@@ -1,12 +1,4 @@
-/**
- * Shopify data fetching utilities
- * Migrated from original Netlify functions
- */
-
-interface DateRange {
-  fromDate: string; // YYYY-MM-DD
-  toDate: string; // YYYY-MM-DD
-}
+import { shopifyDateBounds, type ShopifyDateRange } from "./shopify-date";
 
 interface ShopifyOrder {
   id: string;
@@ -14,490 +6,313 @@ interface ShopifyOrder {
   created_at: string;
   total_price: string;
   currency: string;
-  customer?: {
-    first_name?: string;
-    last_name?: string;
-  };
+  financial_status?: string | null;
+  test?: boolean;
+  cancelled_at?: string | null;
+  fulfillment_status?: string | null;
+  customer?: { first_name?: string; last_name?: string };
   line_items: any[];
-  shipping_address?: {
-    country?: string;
-  };
+  shipping_address?: { country?: string };
   shipping_lines: any[];
 }
 
-function offsetToTzString(offsetMinutes: number): string {
-  const sign = offsetMinutes <= 0 ? "-" : "+";
-  const abs = Math.abs(offsetMinutes);
-  const hours = String(Math.floor(abs / 60)).padStart(2, "0");
-  const mins = String(abs % 60).padStart(2, "0");
-  return `${sign}${hours}:${mins}`;
+/** page_info is opaque: use Shopify's supplied Link URL, never reconstruct it. */
+function nextShopifyPage(link: string | null, originalUrl: URL): URL | null {
+  const next = link?.split(",").find(part => /;\s*rel="?next"?/i.test(part));
+  const match = next?.match(/<([^>]+)>/);
+  if (!match) return null;
+  const url = new URL(match[1]);
+  if (url.origin !== originalUrl.origin || url.pathname !== originalUrl.pathname ||
+      !url.searchParams.has("page_info")) {
+    throw new Error("Shopify returned an invalid pagination link");
+  }
+  return url;
+}
+
+async function shopifyList<T>(
+  original: URL,
+  accessToken: string,
+  resource: "orders" | "disputes",
+  accept: (item: T) => boolean
+): Promise<T[]> {
+  let url: URL | null = original;
+  const visited = new Set<string>();
+  const result: T[] = [];
+  while (url) {
+    if (visited.has(url.toString())) throw new Error(`Shopify ${resource} pagination repeated a cursor`);
+    visited.add(url.toString());
+    const response = await fetch(url.toString(), { headers: { "X-Shopify-Access-Token": accessToken } });
+    if (!response.ok) throw new Error(`Shopify ${resource} API returned HTTP ${response.status}; verify store access and scopes`);
+    const items = (await response.json())[resource];
+    if (!Array.isArray(items)) throw new Error(`Shopify ${resource} response is incomplete`);
+    result.push(...items.filter(accept));
+    url = nextShopifyPage(response.headers.get("Link"), original);
+  }
+  return result;
 }
 
 export async function fetchShopifyOrders(
   shopDomain: string,
   accessToken: string,
-  dateRange: DateRange,
-  timezoneOffset: number = -300,
-  apiVersion: string = "2026-07"
+  dateRange: ShopifyDateRange,
+  timezoneOffset = -300,
+  apiVersion = "2026-07",
+  timeZone?: string | null
 ): Promise<ShopifyOrder[]> {
-  const tz = offsetToTzString(timezoneOffset);
-  const createdMin = `${dateRange.fromDate}T00:00:00${tz}`;
-  const createdMax = `${dateRange.toDate}T23:59:59${tz}`;
+  const { start, end } = shopifyDateBounds(dateRange, timezoneOffset, timeZone);
+  const url = new URL(`https://${shopDomain}/admin/api/${apiVersion}/orders.json`);
+  url.searchParams.set("limit", "250");
+  url.searchParams.set("status", "any");
+  url.searchParams.set("created_at_min", new Date(start).toISOString());
+  // Shopify's upper bound is inclusive: fetch next midnight, then exclude it locally.
+  url.searchParams.set("created_at_max", new Date(end).toISOString());
+  url.searchParams.set("fields", "id,order_number,created_at,total_price,currency,customer,line_items,shipping_address,shipping_lines,total_discounts,total_tip_received,financial_status,test,cancelled_at,fulfillment_status");
+  return shopifyList<ShopifyOrder>(url, accessToken, "orders", order => {
+    const created = Date.parse(order.created_at);
+    if (!Number.isFinite(created)) throw new Error("Shopify returned an order without a valid date");
+    return created >= start && created < end;
+  });
+}
 
-  const baseUrl = `https://${shopDomain}/admin/api/${apiVersion}/orders.json`;
-
-  const orders: ShopifyOrder[] = [];
-  let nextPageInfo: string | null = null;
-  let safety = 0;
-
-  while (true) {
-    const url = new URL(baseUrl);
-
-    if (nextPageInfo) {
-      url.searchParams.set("page_info", nextPageInfo);
-      url.searchParams.set("limit", "250");
-    } else {
-      url.searchParams.set("status", "any");
-      url.searchParams.set("limit", "250");
-      url.searchParams.set("created_at_min", createdMin);
-      url.searchParams.set("created_at_max", createdMax);
-      url.searchParams.set(
-        "fields",
-        "id,order_number,created_at,total_price,currency,customer,line_items,shipping_address,shipping_lines,total_discounts,total_tip_received,current_total_discounts_set,financial_status"
-      );
-    }
-
-    const res = await fetch(url.toString(), {
-      headers: {
-        "X-Shopify-Access-Token": accessToken,
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Shopify Orders API error ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
-    const list = data.orders || [];
-    if (!list.length) break;
-
-    orders.push(...list);
-
-    const linkHeader = res.headers.get("link") || res.headers.get("Link");
-    if (!linkHeader) break;
-    const parts = linkHeader.split(",");
-    const nextPart = parts.find((p) => p.includes('rel="next"'));
-    if (!nextPart) break;
-    const match = nextPart.match(/<([^>]+)>/);
-    if (!match) break;
-    const nextUrl = new URL(match[1]);
-    const pageInfo = nextUrl.searchParams.get("page_info");
-    if (!pageInfo) break;
-    nextPageInfo = pageInfo;
-
-    safety++;
-    if (safety > 60) break;
-  }
-
-  return orders;
+export type DisputeStatus = "won" | "lost" | "accepted" | "charge_refunded" |
+  "needs_response" | "under_review" | "prevented";
+export interface DisputeSummary {
+  count: number;
+  wonCount: number;
+  lostCount: number;
+  acceptedCount: number;
+  refundedCount: number;
+  pendingCount: number;
+  preventedCount: number;
+  /** Disputed face value is case metadata, not actual money debited or recovered. */
+  amountsByCurrency: Record<string, Partial<Record<DisputeStatus, number>>>;
+}
+interface ShopifyDispute {
+  id: number;
+  initiated_at: string;
+  amount: string;
+  currency: string;
+  status: string;
+  type: string;
 }
 
 export async function fetchShopifyDisputes(
   shopDomain: string,
   accessToken: string,
-  dateRange: DateRange,
-  timezoneOffset: number = -300,
-  apiVersion: string = "2026-07"
-): Promise<{ 
-  totalAmount: number; 
-  count: number;
-  wonAmount: number;
-  wonCount: number;
-  lostAmount: number;
-  lostCount: number;
-  pendingAmount: number;
-  pendingCount: number;
-}> {
-  const tz = offsetToTzString(timezoneOffset);
-  const initiatedMin = `${dateRange.fromDate}T00:00:00${tz}`;
-  const initiatedMax = `${dateRange.toDate}T23:59:59${tz}`;
-
-  const baseUrl = `https://${shopDomain}/admin/api/${apiVersion}/shopify_payments/disputes.json`;
-
-  // Helper function to fetch disputes by status
-  async function fetchByStatus(status: string): Promise<{ amount: number; count: number }> {
-    let totalAmount = 0;
-    let totalCount = 0;
-    let nextPageInfo: string | null = null;
-    let safety = 0;
-
-    while (true) {
-      const url = new URL(baseUrl);
-
-      if (nextPageInfo) {
-        url.searchParams.set("page_info", nextPageInfo);
-        url.searchParams.set("limit", "250");
-      } else {
-        url.searchParams.set("status", status);
-        url.searchParams.set("limit", "250");
-        url.searchParams.set("initiated_at_min", initiatedMin);
-        url.searchParams.set("initiated_at_max", initiatedMax);
-        url.searchParams.set("fields", "id,amount,currency,status");
-      }
-
-      const res = await fetch(url.toString(), {
-        headers: {
-          "X-Shopify-Access-Token": accessToken,
-          "Content-Type": "application/json",
-        },
-      });
-
-      if (!res.ok) {
-        if (res.status === 404) {
-          return { amount: 0, count: 0 };
-        }
-        const text = await res.text();
-        throw new Error(`Shopify Disputes API error ${res.status}: ${text}`);
-      }
-
-      const data = await res.json();
-      const list = data.disputes || [];
-      if (!list.length) break;
-
-      for (const dispute of list) {
-        const val = parseFloat(dispute.amount || "0");
-        if (!isNaN(val)) {
-          totalAmount += val;
-        }
-        totalCount++;
-        console.log(`[Dispute ${status.toUpperCase()}] ID: ${dispute.id}, Amount: ${dispute.amount} ${dispute.currency}, Status: ${dispute.status}`);
-      }
-
-      const linkHeader = res.headers.get("link") || res.headers.get("Link");
-      if (!linkHeader) break;
-      const parts = linkHeader.split(",");
-      const nextPart = parts.find((p) => p.includes('rel="next"'));
-      if (!nextPart) break;
-      const match = nextPart.match(/<([^>]+)>/);
-      if (!match) break;
-      const nextUrl = new URL(match[1]);
-      const pageInfo = nextUrl.searchParams.get("page_info");
-      if (!pageInfo) break;
-      nextPageInfo = pageInfo;
-
-      safety++;
-      if (safety > 60) break;
-    }
-
-    return { amount: totalAmount, count: totalCount };
-  }
-
-  // Fetch won, lost, and pending disputes
-  // Pending includes: needs_response, under_review
-  const [won, lost, needsResponse, underReview] = await Promise.all([
-    fetchByStatus("won"),
-    fetchByStatus("lost"),
-    fetchByStatus("needs_response"),
-    fetchByStatus("under_review")
-  ]);
-
-  const pendingAmount = needsResponse.amount + underReview.amount;
-  const pendingCount = needsResponse.count + underReview.count;
-  const totalAmount = won.amount + lost.amount + pendingAmount;
-  const totalCount = won.count + lost.count + pendingCount;
-
-  console.log(`[Disputes Summary] Won: ${won.count} ($${won.amount.toFixed(2)}), Lost: ${lost.count} ($${lost.amount.toFixed(2)}), Pending: ${pendingCount} ($${pendingAmount.toFixed(2)}), Total: ${totalCount} ($${totalAmount.toFixed(2)})`);
-
-  return { 
-    totalAmount,
-    count: totalCount,
-    wonAmount: won.amount,
-    wonCount: won.count,
-    lostAmount: lost.amount,
-    lostCount: lost.count,
-    pendingAmount,
-    pendingCount
+  dateRange: ShopifyDateRange,
+  timezoneOffset = -300,
+  apiVersion = "2026-07",
+  timeZone?: string | null
+): Promise<DisputeSummary> {
+  const { start, end } = shopifyDateBounds(dateRange, timezoneOffset, timeZone);
+  const url = new URL(`https://${shopDomain}/admin/api/${apiVersion}/shopify_payments/disputes.json`);
+  // REST documents a single initiated_at date but no initiated_at_min/max.
+  // Traverse all cursor pages because this resource's sort order is not guaranteed.
+  url.searchParams.set("limit", "250");
+  const list = await shopifyList<ShopifyDispute>(url, accessToken, "disputes", dispute => {
+    const initiated = Date.parse(dispute.initiated_at);
+    if (!Number.isFinite(initiated)) throw new Error("Shopify dispute is missing initiated_at");
+    return initiated >= start && initiated < end;
+  });
+  const summary: DisputeSummary = {
+    count: 0, wonCount: 0, lostCount: 0, acceptedCount: 0,
+    refundedCount: 0, pendingCount: 0, preventedCount: 0, amountsByCurrency: {},
   };
+  const seen = new Set<number>();
+  for (const dispute of list) {
+    const id = Number(dispute.id);
+    if (!Number.isSafeInteger(id)) throw new Error("Shopify dispute is missing a valid ID");
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const amount = Number(dispute.amount);
+    const currency = dispute.currency?.toUpperCase();
+    if (!Number.isFinite(amount) || amount < 0 || !/^[A-Z]{3}$/.test(currency ?? "")) {
+      throw new Error("Shopify dispute has an invalid amount or currency");
+    }
+    const status = dispute.status?.toLowerCase() as DisputeStatus;
+    if (!["won", "lost", "accepted", "charge_refunded", "needs_response", "under_review", "prevented"].includes(status)) {
+      throw new Error(`Unrecognized Shopify dispute status: ${String(dispute.status)}`);
+    }
+    summary.count++;
+    if (status === "won") summary.wonCount++;
+    if (status === "lost") summary.lostCount++;
+    if (status === "accepted") summary.acceptedCount++;
+    if (status === "charge_refunded") summary.refundedCount++;
+    if (status === "prevented") summary.preventedCount++;
+    if (status === "needs_response" || status === "under_review") summary.pendingCount++;
+    const amounts = (summary.amountsByCurrency[currency] ??= {});
+    amounts[status] = (amounts[status] ?? 0) + amount;
+  }
+  return summary;
 }
 
-/**
- * Fetch Shopify Balance Transactions to get actual processing fees
- * Balance transactions include the actual fees charged by Shopify Payments
- */
-interface BalanceTransaction {
+export interface BalanceTransaction {
   id: number;
-  type: string; // "charge", "refund", "dispute", etc.
+  type: string;
   amount: string;
-  fee: string; // The actual processing fee
+  fee: string;
   net: string;
-  source_order_id: number | null;
-  source_order_transaction_id: number | null;
-  source_type: string;
+  source_id?: number | null;
+  source_order_id?: number | null;
+  source_order_transaction_id?: number | null;
+  source_type?: string | null;
   currency: string;
   processed_at: string;
+  test?: boolean;
+}
+export interface BalanceSummary {
+  orderFees: Map<number, number>;
+  /** All Shopify Payments charge fees posted in this period. */
+  chargeFeesTotal: number;
+  /** Dispute principal debited, including unresolved chargebacks. */
+  totalDisputeValue: number;
+  totalDisputeFees: number;
+  /** Principal credited, not necessarily every case currently marked won. */
+  totalDisputeRecovered: number;
+  totalDisputeFeesRecovered: number;
+  /** Signed refund principal (credits/reversals reduce this number). */
+  totalRefunds: number;
+  refundFeeAdjustments: number;
+  pageCount: number;
+  fxApproximate: boolean;
+  unclassifiedTypes: string[];
+  unclassifiedSignedNet: number;
+  unclassifiedCount: number;
+  holdMovement: number;
+}
+
+function money(value: string | number | undefined, label: string): number {
+  if (value == null || String(value).trim() === "" || !Number.isFinite(Number(value))) {
+    throw new Error(`Shopify balance row has an invalid ${label}`);
+  }
+  return Number(value);
+}
+function usd(amount: number, currency: string, eurToUsdRate: number): number {
+  if (currency === "USD") return amount;
+  if (currency === "EUR" && Number.isFinite(eurToUsdRate) && eurToUsdRate > 0) {
+    return Math.round(amount * eurToUsdRate * 100) / 100;
+  }
+  throw new Error(`Unsupported Shopify payout currency ${currency}; cannot safely add it as USD`);
+}
+
+/** Classify actual signed ledger postings; dispute case status never posts money. */
+export function summarizeBalanceTransactions(
+  transactions: BalanceTransaction[],
+  eurToUsdRate: number
+): Omit<BalanceSummary, "pageCount"> {
+  const totals: Omit<BalanceSummary, "pageCount"> = {
+    orderFees: new Map(), chargeFeesTotal: 0, totalDisputeValue: 0, totalDisputeFees: 0,
+    totalDisputeRecovered: 0, totalDisputeFeesRecovered: 0,
+    totalRefunds: 0, refundFeeAdjustments: 0, fxApproximate: false,
+    unclassifiedTypes: [], unclassifiedSignedNet: 0, unclassifiedCount: 0,
+    holdMovement: 0,
+  };
+  const seen = new Set<number>();
+  const unknown = new Set<string>();
+  for (const row of transactions) {
+    const id = Number(row.id);
+    if (!Number.isSafeInteger(id)) throw new Error("Shopify balance row has an invalid ID");
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (row.test) continue;
+    const currency = row.currency?.toUpperCase();
+    const amount = money(row.amount, "amount");
+    const fee = money(row.fee, "fee");
+    const net = money(row.net, "net");
+    const value = usd(amount, currency, eurToUsdRate);
+    const feeUsd = usd(fee, currency, eurToUsdRate);
+    const netUsd = usd(net, currency, eurToUsdRate);
+    if (currency === "EUR") totals.fxApproximate = true;
+    const type = String(row.type || "").toLowerCase().replace(/\s+/g, "_");
+    const source = String(row.source_type || "").toLowerCase();
+    const standaloneFee = type === "chargeback_fee" || type === "chargeback_fee_refund";
+    const hold = type === "chargeback_hold" || type === "chargeback_hold_release" ||
+      type === "reserve" || type.startsWith("reserved_funds") ||
+      type === "risk_withdrawal" || type === "risk_reversal";
+    const dispute = type === "dispute" || type === "chargeback" ||
+      type === "dispute_withdrawal" || type === "dispute_reversal" ||
+      type === "chargeback_reversal" || type === "chargeback_won" ||
+      (type === "adjustment" && source.includes("dispute"));
+    if (hold) {
+      totals.holdMovement += netUsd;
+    } else if (standaloneFee) {
+      // A standalone fee row's net is the fee debit or refund; its fee field
+      // may be zero because the fee is represented as gross amount instead.
+      if (netUsd < 0) totals.totalDisputeFees -= netUsd;
+      else totals.totalDisputeFeesRecovered += netUsd;
+    } else if (dispute) {
+      if (Math.abs(amount - fee - net) > 0.02) {
+        throw new Error("Shopify dispute balance row did not reconcile: net differs from amount minus fee");
+      }
+      if (value < 0) totals.totalDisputeValue -= value;
+      else totals.totalDisputeRecovered += value;
+      if (feeUsd > 0) totals.totalDisputeFees += feeUsd;
+      else totals.totalDisputeFeesRecovered -= feeUsd;
+    } else if (type === "refund" || type === "refund_adjustment" || type === "refund_failure") {
+      totals.totalRefunds -= value;
+      totals.refundFeeAdjustments += feeUsd;
+    } else if (type === "charge") {
+      totals.chargeFeesTotal += feeUsd;
+      const orderId = Number(row.source_order_id);
+      if (Number.isSafeInteger(orderId) && orderId > 0) {
+        totals.orderFees.set(orderId, (totals.orderFees.get(orderId) ?? 0) + feeUsd);
+      } else if (feeUsd !== 0) {
+        unknown.add("charge_without_order");
+      }
+    } else if (type === "payout" || type.startsWith("payout_") ||
+      type === "transfer" || type.startsWith("transfer_") ||
+      type.startsWith("balance_transfer_")) {
+      // A payout/transfer moves already recorded money; it isn't new profit.
+    } else if (Math.abs(netUsd) > 0.005) {
+      unknown.add(type || "missing_type");
+      totals.unclassifiedSignedNet += netUsd;
+      totals.unclassifiedCount++;
+    }
+  }
+  totals.unclassifiedTypes = Array.from(unknown).sort();
+  return totals;
 }
 
 export async function fetchShopifyBalanceTransactions(
   shopDomain: string,
   accessToken: string,
-  dateRange: DateRange,
-  apiVersion: string = "2026-07",
-  eurToUsdRate: number = 1.1665,
-  timezoneOffsetMinutes: number = -300 // Default: EST (UTC-5)
-): Promise<{ orderFees: Map<number, number>; totalDisputeValue: number; totalDisputeFees: number; totalDisputeRecovered: number; totalDisputeFeesRecovered: number; totalRefunds: number; pageCount: number }> {
-  // Returns order fees map, dispute value, and dispute fees separately
-  const baseUrl = `https://${shopDomain}/admin/api/${apiVersion}/shopify_payments/balance/transactions.json`;
-  
-  const orderFees = new Map<number, number>();
-  let totalDisputeValue = 0;
-  let totalDisputeFees = 0;
-  let totalDisputeRecovered = 0; // Track money recovered from won chargebacks
-  let totalDisputeFeesRecovered = 0; // Track fees recovered from won chargebacks
-  let totalRefunds = 0; // Track total refund amounts
+  dateRange: ShopifyDateRange,
+  apiVersion = "2026-07",
+  eurToUsdRate = 1.1665,
+  timezoneOffsetMinutes = -300,
+  timeZone?: string | null
+): Promise<BalanceSummary> {
+  const { start, end } = shopifyDateBounds(dateRange, timezoneOffsetMinutes, timeZone);
+  const original = new URL(`https://${shopDomain}/admin/api/${apiVersion}/shopify_payments/balance/transactions.json`);
+  original.searchParams.set("limit", "250");
+  let url: URL | null = original;
+  const visited = new Set<string>();
+  const rows: BalanceTransaction[] = [];
   let pageCount = 0;
-  const MAX_PAGES = 10; // Safety limit: fetch max 10 pages (2500 transactions)
-  let hasMore = true;
-  let lastId: number | null = null;
-
-  while (hasMore && pageCount < MAX_PAGES) {
-    pageCount++;
-    const params = new URLSearchParams({
-      limit: "250",
-      // Note: API doesn't support processed_at filtering, we filter client-side after fetching
-      // payout_date filtering excludes pending transactions, so we don't use it
-    });
-    
-    if (lastId) {
-      params.append("last_id", lastId.toString());
-    }
-
-    const url = `${baseUrl}?${params.toString()}`;
-    
-    const response = await fetch(url, {
-      headers: {
-        "X-Shopify-Access-Token": accessToken,
-        "Content-Type": "application/json",
-      },
-    });
-
+  while (url) {
+    if (visited.has(url.toString())) throw new Error("Shopify balance pagination repeated a cursor");
+    visited.add(url.toString());
+    const response = await fetch(url.toString(), { headers: { "X-Shopify-Access-Token": accessToken } });
     if (!response.ok) {
-      // If 404 or 403, the store doesn't have access to balance transactions (not using Shopify Payments or missing permissions)
-      if (response.status === 404 || response.status === 403) {
-        console.log(`[Balance Transactions] Not available for this store (${response.status}), using calculated fees`);
-        return { orderFees: new Map(), totalDisputeValue: 0, totalDisputeFees: 0, totalDisputeRecovered: 0, totalDisputeFeesRecovered: 0, totalRefunds: 0, pageCount: 0 }; // Return empty data, will fall back to calculated fees
+      if (response.status === 403 || response.status === 404) {
+        throw new Error(`Shopify Payments ledger unavailable (HTTP ${response.status}). Reconnect with payout access; refunds and dispute fees cannot be verified.`);
       }
-      const errorText = await response.text();
-      throw new Error(
-        `Shopify balance transactions API error: ${response.status} ${response.statusText} - ${errorText}`
-      );
+      throw new Error(`Shopify Payments ledger API returned HTTP ${response.status}`);
     }
-
-    const data = await response.json();
-    const transactions: BalanceTransaction[] = data.transactions || [];
-
-    if (transactions.length === 0) {
-      hasMore = false;
-      break;
+    pageCount++;
+    const page: BalanceTransaction[] = (await response.json()).transactions;
+    if (!Array.isArray(page)) throw new Error("Shopify balance response is incomplete");
+    let older = false;
+    for (const row of page) {
+      const processed = Date.parse(row.processed_at);
+      if (!Number.isFinite(processed)) throw new Error("Shopify balance row lacks processed_at");
+      if (processed >= start && processed < end) rows.push(row);
+      if (processed < start) older = true;
     }
-
-    // Process transactions with date filtering
-    for (const txn of transactions) {
-      // Filter by date range using processed_at timestamp
-      // Account for store timezone: interpret date strings in store's local time, not UTC
-      const txnDate = new Date(txn.processed_at);
-      
-      // Create date range in store's timezone
-      // Example: If store is EST (UTC-5, offset = -300), and user selects "2025-12-14":
-      // - fromDate should be 2025-12-14 00:00:00 EST = 2025-12-14 05:00:00 UTC
-      // - toDate should be 2025-12-14 23:59:59 EST = 2025-12-15 04:59:59 UTC
-      const fromDate = new Date(dateRange.fromDate + 'T00:00:00');
-      const toDate = new Date(dateRange.toDate + 'T23:59:59');
-      
-      // Adjust for timezone offset (offset is in minutes, negative for west of UTC)
-      // Convert offset to milliseconds and subtract (because offset is negative for EST)
-      const offsetMs = timezoneOffsetMinutes * 60 * 1000;
-      fromDate.setTime(fromDate.getTime() - offsetMs);
-      toDate.setTime(toDate.getTime() - offsetMs);
-      
-      // Debug logging for order 12621097337158
-      if (txn.source_order_id === 12621097337158) {
-        console.log(`[Date Filter Debug] Order 12621097337158 transaction:`, {
-          processed_at: txn.processed_at,
-          txnDate: txnDate.toISOString(),
-          fromDate: fromDate.toISOString(),
-          toDate: toDate.toISOString(),
-          passesFilter: !(txnDate < fromDate || txnDate > toDate),
-          txnBeforeFrom: txnDate < fromDate,
-          txnAfterTo: txnDate > toDate
-        });
-      }
-      
-      // Skip transactions outside the date range
-      if (txnDate < fromDate || txnDate > toDate) {
-        continue;
-      }
-      
-      // Normalize transaction type for comparison (case-insensitive, spaces to underscores)
-      const txnTypeNormalized = (txn.type || "").toLowerCase().replace(/\s+/g, "_");
-      
-      // Log ALL transaction types to help debug
-      console.log(`[Transaction] Type: "${txn.type}" -> Normalized: "${txnTypeNormalized}" | Amount: ${txn.amount} | Fee: ${txn.fee} | Date: ${txn.processed_at}`);
-      
-      // Log unusual transaction types to understand what we're seeing
-      const knownTypes = ["charge", "chargeback", "dispute", "refund", "dispute_reversal", "chargeback_reversal", "chargeback_won", "chargeback_fee", "chargeback_fee_refund", "dispute_withdrawal", "chargeback_hold", "chargeback_hold_release"];
-      if (!knownTypes.includes(txnTypeNormalized)) {
-        console.log(`[Unknown Transaction Type] ${txn.type}:`, {
-          txn_id: txn.id,
-          type: txn.type,
-          source_type: txn.source_type,
-          source_order_id: txn.source_order_id,
-          amount: txn.amount,
-          fee: txn.fee,
-          currency: txn.currency
-        });
-      }
-      
-      // Extract processing fees from ALL transactions linked to orders
-      // Capture fees from ANY transaction type that has a source_order_id
-      // Only exclude disputes/chargebacks (handled separately below)
-      if (txn.source_order_id && txnTypeNormalized !== "chargeback" && txnTypeNormalized !== "dispute" && txnTypeNormalized !== "refund") {
-        const orderId = Number(txn.source_order_id); // Ensure it's a number
-        const feeAmount = Math.abs(parseFloat(txn.fee)); // Use absolute value like disputes
-        // Convert to USD if currency is EUR
-        const feeUsd = txn.currency === "EUR" ? feeAmount * eurToUsdRate : feeAmount;
-        
-        // Debug logging for ALL orders to understand fee structure
-        console.log(`[Fee Transaction] Order ${orderId} (type: ${txn.type}):`, {
-          txn_id: txn.id,
-          type: txn.type,
-          source_type: txn.source_type,
-          amount: txn.amount,
-          fee_original: feeAmount.toFixed(2),
-          fee_usd: feeUsd.toFixed(2),
-          processed_at: txn.processed_at,
-          currency: txn.currency
-        });
-        
-        // Accumulate fees for the same order (in case there are multiple charges)
-        const existingFee = orderFees.get(orderId) || 0;
-        orderFees.set(orderId, existingFee + feeUsd);
-        
-        console.log(`[Fee Transaction] Order ${orderId} running total: $${orderFees.get(orderId)?.toFixed(2)}`);
-      }
-      
-      // Handle all dispute-related transactions
-      // Shopify uses "dispute" type for both won and lost chargebacks
-      // The sign of the amount determines won vs lost:
-      // - NEGATIVE amount = Lost chargeback (money taken from you)
-      // - POSITIVE amount = Won chargeback (money returned to you)
-      const disputeTypes = ["chargeback", "dispute", "dispute_withdrawal", "dispute_reversal", "chargeback_reversal", "chargeback_won"];
-      
-      if (disputeTypes.includes(txnTypeNormalized)) {
-        const rawAmount = parseFloat(txn.amount); // Keep the sign to determine won vs lost
-        const rawFee = parseFloat(txn.fee); // Fee (usually negative when charged)
-        
-        // Convert to USD if currency is EUR
-        const amountUsd = txn.currency === "EUR" ? rawAmount * eurToUsdRate : rawAmount;
-        const feeUsd = txn.currency === "EUR" ? rawFee * eurToUsdRate : rawFee;
-        
-        console.log(`[Dispute Transaction] Found ${txn.type}:`, {
-          txn_id: txn.id,
-          type: txn.type,
-          source_type: txn.source_type,
-          source_order_id: txn.source_order_id,
-          raw_amount: rawAmount,
-          raw_fee: rawFee,
-          amount_usd: amountUsd.toFixed(2),
-          fee_usd: feeUsd.toFixed(2),
-          currency: txn.currency,
-          processed_at: txn.processed_at,
-          is_won: rawAmount > 0 ? 'YES (positive amount)' : 'NO (negative amount)'
-        });
-        
-        // Determine if this is a won or lost dispute based on amount sign
-        if (rawAmount > 0) {
-          // POSITIVE amount = Won chargeback (money returned to you)
-          totalDisputeRecovered += Math.abs(amountUsd);
-          // Fee is also recovered when you win (take absolute value regardless of sign)
-          // The fee might be positive (refund) or we use the same fee that was charged
-          const feeRecovered = Math.abs(feeUsd);
-          totalDisputeFeesRecovered += feeRecovered;
-          console.log(`[Dispute WON] Amount recovered: $${Math.abs(amountUsd).toFixed(2)}, Fee recovered: $${feeRecovered.toFixed(2)} (raw fee: ${rawFee})`);
-        } else if (rawAmount < 0) {
-          // NEGATIVE amount = Lost chargeback (money taken from you)
-          totalDisputeValue += Math.abs(amountUsd);
-          // Fee is charged to you (take absolute value)
-          totalDisputeFees += Math.abs(feeUsd);
-          console.log(`[Dispute LOST] Amount lost: $${Math.abs(amountUsd).toFixed(2)}, Fee charged: $${Math.abs(feeUsd).toFixed(2)}`);
-        }
-        // Note: rawAmount === 0 transactions are ignored (no financial impact)
-      }
-      
-      // Handle chargeback_fee separately (standalone fee transaction)
-      if (txnTypeNormalized === "chargeback_fee") {
-        const feeAmount = Math.abs(parseFloat(txn.amount)); // The fee amount
-        const feeUsd = txn.currency === "EUR" ? feeAmount * eurToUsdRate : feeAmount;
-        
-        console.log(`[Chargeback Fee] Found:`, {
-          txn_id: txn.id,
-          type: txn.type,
-          fee_amount: feeAmount,
-          fee_usd: feeUsd.toFixed(2),
-          currency: txn.currency,
-          processed_at: txn.processed_at
-        });
-        
-        totalDisputeFees += feeUsd;
-      }
-      
-      // Handle chargeback_fee_refund separately (fee recovery only)
-      if (txnTypeNormalized === "chargeback_fee_refund") {
-        const refundedFee = Math.abs(parseFloat(txn.amount)); // The fee amount being refunded
-        const refundedFeeUsd = txn.currency === "EUR" ? refundedFee * eurToUsdRate : refundedFee;
-        
-        console.log(`[Chargeback Fee Refund] Found:`, {
-          txn_id: txn.id,
-          type: txn.type,
-          fee_refunded: refundedFee,
-          fee_refunded_usd: refundedFeeUsd.toFixed(2),
-          currency: txn.currency,
-          processed_at: txn.processed_at
-        });
-        
-        totalDisputeFeesRecovered += refundedFeeUsd;
-      }
-      
-      // Extract refunds
-      if (txn.type === "refund") {
-        const refundAmount = Math.abs(parseFloat(txn.amount)); // Refund amount (money returned to customer)
-        // Convert to USD if currency is EUR
-        const refundUsd = txn.currency === "EUR" ? refundAmount * eurToUsdRate : refundAmount;
-        
-        console.log(`[Refund Transaction] Found refund:`, {
-          txn_id: txn.id,
-          source_order_id: txn.source_order_id,
-          amount_original: refundAmount,
-          amount_usd: refundUsd.toFixed(2),
-          currency: txn.currency,
-          processed_at: txn.processed_at
-        });
-        
-        // Accumulate total refunds
-        totalRefunds += refundUsd;
-      }
-    }
-    // Check if there are more pages
-    const linkHeader = response.headers.get("link");
-    if (linkHeader && linkHeader.includes('rel="next"')) {
-      lastId = transactions[transactions.length - 1].id;
-    } else {
-      hasMore = false;
-    }
+    // The ledger is documented newest-first by processed_at. Do not silently
+    // cap to ten pages; stop only when older entries have been reached.
+    if (older) break;
+    url = nextShopifyPage(response.headers.get("Link"), original);
   }
-
-  console.log(`[Balance Transactions] Fetched ${orderFees.size} orders with fees from ${pageCount} pages, dispute value: $${totalDisputeValue.toFixed(2)}, dispute fees: $${totalDisputeFees.toFixed(2)}, dispute recovered: $${totalDisputeRecovered.toFixed(2)}, refunds: $${totalRefunds.toFixed(2)}`);
-  console.log(`[Balance Transactions] Sample orderFees entries:`, Array.from(orderFees.entries()).slice(0, 5));
-  return { orderFees, totalDisputeValue, totalDisputeFees, totalDisputeRecovered, totalDisputeFeesRecovered, totalRefunds, pageCount };
+  return { ...summarizeBalanceTransactions(rows, eurToUsdRate), pageCount };
 }

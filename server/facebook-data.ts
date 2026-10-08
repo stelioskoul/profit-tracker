@@ -28,16 +28,17 @@ export async function fetchFacebookAdSpend(
 
   const res = await fetch(url.toString());
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Facebook API error ${res.status}: ${text}`);
+    throw new Error(`Facebook insights API returned HTTP ${res.status}`);
   }
 
   const data = await res.json();
   let spend = 0;
 
   if (Array.isArray(data.data) && data.data.length > 0) {
-    const val = parseFloat(data.data[0].spend || "0");
-    spend = isNaN(val) ? 0 : val;
+    spend = Number(data.data[0].spend);
+    if (!Number.isFinite(spend) || spend < 0) {
+      throw new Error("Facebook returned invalid ad spend");
+    }
   }
 
   // Get account currency
@@ -46,12 +47,10 @@ export async function fetchFacebookAdSpend(
   accountUrl.searchParams.set("fields", "currency");
 
   const accountRes = await fetch(accountUrl.toString());
-  let currency = "EUR"; // Default to EUR
-
-  if (accountRes.ok) {
-    const accountData = await accountRes.json();
-    currency = accountData.currency || "EUR";
-  }
+  if (!accountRes.ok) throw new Error(`Facebook account currency unavailable (HTTP ${accountRes.status})`);
+  const accountData = await accountRes.json();
+  const currency = accountData.currency?.toUpperCase();
+  if (!currency) throw new Error("Facebook account currency is missing");
 
   return { spend, currency };
 }

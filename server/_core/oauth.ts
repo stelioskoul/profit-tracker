@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import * as db from "../db";
 import { verifyOAuthState } from "../oauth-state";
-import { exchangeShopifyCode, normalizeShopDomain, verifyShopifyHmac } from "../shopify-oauth";
+import { exchangeShopifyCode, normalizeShopDomain, verifyShopifyFinancialAccess, verifyShopifyHmac } from "../shopify-oauth";
 import { exchangeFacebookCode, exchangeForLongLivedToken, getFacebookAdAccounts } from "../facebook-oauth";
 import { getSessionUserId } from "./sdk";
 
@@ -37,17 +37,18 @@ export function registerOAuthRoutes(app: Express) {
       const storeId = await authorizedStore(req, state, "shopify");
       const domain = normalizeShopDomain(shop);
       const token = await exchangeShopifyCode(domain, code);
+      const grantedScopes = await verifyShopifyFinancialAccess(domain, token.access_token);
       await db.upsertShopifyConnection({
         storeId,
         shopDomain: domain,
         accessToken: token.access_token,
-        scopes: token.scope,
+        scopes: grantedScopes || token.scope,
         apiVersion: "2026-07",
       });
       return res.redirect(302, `/store/${storeId}/connections`);
     } catch (error) {
       console.error("[Shopify OAuth] Callback rejected:", error instanceof Error ? error.message : String(error));
-      return res.status(403).json({ error: "Shopify connection failed; sign in and retry" });
+      return res.status(403).json({ error: "Shopify connection failed. Ensure the app has orders, disputes and Shopify Payments payout access, then sign in and retry." });
     }
   });
 

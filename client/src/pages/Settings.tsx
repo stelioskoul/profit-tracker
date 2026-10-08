@@ -11,10 +11,10 @@ import { useParams } from "wouter";
 import { toast } from "sonner";
 
 const TIMEZONES = [
-  { value: "America/Bogota", label: "Bogota (UTC-05:00)", offset: -300 },
-  { value: "America/New_York", label: "New York (EST/EDT)", offset: -300 },
-  { value: "America/Los_Angeles", label: "Los Angeles (PST/PDT)", offset: -480 },
-  { value: "Europe/Athens", label: "Greece (EET/EEST)", offset: -120 },
+  { value: "America/Bogota", label: "Bogota (UTC-05:00)" },
+  { value: "America/New_York", label: "New York (EST/EDT)" },
+  { value: "America/Los_Angeles", label: "Los Angeles (PST/PDT)" },
+  { value: "Europe/Athens", label: "Greece (EET/EEST)" },
 ];
 
 export default function Settings() {
@@ -56,7 +56,7 @@ export default function Settings() {
 
     updateStoreMutation.mutate({
       id: storeId,
-      timezoneOffset: timezoneData.offset,
+      timezone: timezoneData.value,
     });
   };
 

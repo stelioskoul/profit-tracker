@@ -2,8 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "pnpm build:vercel",
   "functions": {
-    "app.ts": {
-      "includeFiles": "public/index.html"
+    "app.cjs": {
+      "includeFiles": "dist/vercel-api.cjs"
     }
   }
 }

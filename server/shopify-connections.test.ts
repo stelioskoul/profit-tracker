@@ -28,11 +28,22 @@ describe("configured Shopify connections", () => {
     expect(mocks.upsertShopifyConnection).not.toHaveBeenCalled();
   });
   it("verifies the domain and saves the connection and Shopify reporting settings without returning secrets", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ shop: { myshopify_domain: input.shopDomain, currency: "USD", iana_timezone: "America/Bogota" } }))));
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.endsWith("shop.json") ? { shop: { myshopify_domain: input.shopDomain, currency: "USD", iana_timezone: "America/Bogota" } } :
+      { access_scopes: [{ handle: "read_orders" }, { handle: "read_shopify_payments_payouts" }] }
+    ))));
     expect(await appRouter.createCaller(context).shopify.connectConfigured(input)).toEqual({ success: true });
     expect(mocks.getConfiguredShopifyToken).toHaveBeenCalledWith(input.shopDomain, 20);
-    expect(mocks.upsertShopifyConnection).toHaveBeenCalledWith(expect.objectContaining({ storeId: 10, accessToken: "fixture-token", scopes: "read_orders,read_products" }));
+    expect(mocks.upsertShopifyConnection).toHaveBeenCalledWith(expect.objectContaining({ storeId: 10, accessToken: "fixture-token", scopes: "read_orders,read_shopify_payments_payouts" }));
     expect(mocks.updateStore).toHaveBeenCalledWith(10, { currency: "USD", timezone: "America/Bogota", timezoneOffset: -300 });
+  });
+  it("does not save a connection when financial access is missing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify({
+      shop: { myshopify_domain: input.shopDomain, currency: "USD", iana_timezone: "America/Bogota" }
+    }), { status: url.includes("balance/transactions") ? 403 : 200 })));
+    await expect(appRouter.createCaller(context).shopify.connectConfigured(input)).rejects.toThrow("payout ledger access unavailable (HTTP 403)");
+    expect(mocks.upsertShopifyConnection).not.toHaveBeenCalled();
+    expect(mocks.updateStore).not.toHaveBeenCalled();
   });
   it("does not save a connection whose verified Shopify identity differs", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ shop: { myshopify_domain: "different.myshopify.com" } }))));

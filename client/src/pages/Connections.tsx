@@ -16,6 +16,7 @@ export default function Connections() {
   const storeId = parseInt(id || "0");
   const [, setLocation] = useLocation();
   const { isAuthenticated, loading } = useAuth();
+  const utils = trpc.useUtils();
   const [shopDomain, setShopDomain] = useState("");
   const [configuredShop, setConfiguredShop] = useState("");
   const [showManualShopify, setShowManualShopify] = useState(false);
@@ -34,6 +35,7 @@ export default function Connections() {
     onSuccess: () => {
       toast.success("Shopify connected successfully");
       refetchShopify();
+      utils.stores.getById.invalidate({ id: storeId });
     },
     onError: error => toast.error(error.message),
   });
@@ -146,7 +148,7 @@ export default function Connections() {
               <div className="flex items-center justify-between">
                 <div>
                   <CardTitle>Shopify</CardTitle>
-                  <CardDescription>Connect your Shopify store to import orders and products</CardDescription>
+                  <CardDescription>Connect orders, dispute cases and Shopify Payments activity</CardDescription>
                 </div>
                 {shopifyConn ? (
                   <CheckCircle className="h-6 w-6 text-green-500" />
@@ -178,7 +180,8 @@ export default function Connections() {
                   {!showManualShopify ? (
                     <div className="space-y-2">
                       <p className="text-sm text-muted-foreground">
-                        Connect your Shopify store to track orders, products, and revenue.
+                        Beprofit needs its own Shopify connection; the separate Manus Shopify plugin does not connect this app automatically.
+                        The app token must have read_orders, read_shopify_payments_disputes and read_shopify_payments_payouts.
                       </p>
                       {!!availableShops?.length && (
                         <div className="space-y-3">
@@ -221,7 +224,11 @@ export default function Connections() {
                           onChange={(e) => setShopifyToken(e.target.value)}
                         />
                         <p className="text-xs text-muted-foreground">
-                          Create a custom app in your Shopify admin to get an access token
+                          Create or update a Shopify Admin custom app with read_orders,
+                          read_shopify_payments_disputes and read_shopify_payments_payouts,
+                          then install or reinstall it and enter its token. Beprofit checks all
+                          three read endpoints before saving the connection. Order history older
+                          than 60 days also needs Shopify-approved read_all_orders permission.
                         </p>
                       </div>
                       <div className="flex gap-2">

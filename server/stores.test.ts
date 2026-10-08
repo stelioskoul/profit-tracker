@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   upsertProcessingFeesConfig: vi.fn(),
   getStoresByUserId: vi.fn(),
   getStoreById: vi.fn(),
+  updateStore: vi.fn(),
 }));
 vi.mock("./db", async importOriginal => ({
   ...(await importOriginal<typeof import("./db")>()),
@@ -28,6 +29,7 @@ beforeEach(() => {
   mocks.upsertProcessingFeesConfig.mockResolvedValue(undefined);
   mocks.getStoresByUserId.mockResolvedValue([{ id: 42, userId: 1, name: "Test Store", platform: "shopify" }]);
   mocks.getStoreById.mockResolvedValue({ id: 42, userId: 1, name: "Test Store", platform: "shopify" });
+  mocks.updateStore.mockResolvedValue(undefined);
 });
 
 describe("stores procedures", () => {
@@ -47,5 +49,15 @@ describe("stores procedures", () => {
   it("rejects a different user's store ID", async () => {
     await expect(appRouter.createCaller(context(2)).stores.getById({ id: 42 }))
       .rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+  it("updates the canonical IANA zone and a signed UTC-compatible fallback", async () => {
+    await appRouter.createCaller(context()).stores.update({ id: 42, timezone: "Europe/Athens" });
+    expect(mocks.updateStore).toHaveBeenCalledWith(42, expect.objectContaining({
+      timezone: "Europe/Athens", timezoneOffset: 120,
+    }));
+  });
+  it("rejects an offset-only update that would leave the reporting zone unchanged", async () => {
+    await expect(appRouter.createCaller(context()).stores.update({ id: 42, timezoneOffset: -480 }))
+      .rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 });

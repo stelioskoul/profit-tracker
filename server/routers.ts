@@ -5,12 +5,15 @@ import { publicProcedure, router, protectedProcedure } from "./_core/trpc";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import * as db from "./db";
-import { getShopifyAuthUrl, normalizeShopDomain } from "./shopify-oauth";
+import { getShopifyAuthUrl, normalizeShopDomain, verifyShopifyFinancialAccess } from "./shopify-oauth";
 import { getFacebookAuthUrl, getFacebookAdAccounts } from "./facebook-oauth";
 import { createOAuthState } from "./oauth-state";
-import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions } from "./shopify-data";
+import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions, type DisputeSummary } from "./shopify-data";
 import { fetchFacebookAdSpend } from "./facebook-data";
-import { processOrders, calculateProcessingFees, calculateOperationalExpensesForPeriod } from "./profit-calculator";
+import { processOrders, calculateOperationalExpensesForPeriod } from "./profit-calculator";
+import { calculateProfitBreakdown } from "./profit-formula";
+import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
+import { assertOrderHistoryAccess } from "./shopify-order-access";
 import { getEurUsdRate, getCachedRate } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
 
@@ -201,13 +204,12 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ ctx, input }) => {
-        // Calculate timezoneOffset from timezone for backward compatibility
-        const timezoneOffsets: Record<string, number> = {
-          "America/New_York": -300,    // EST: UTC-5
-          "America/Los_Angeles": -480, // PST: UTC-8
-          "Europe/Athens": 120,        // EET: UTC+2
-        };
-        const timezoneOffset = timezoneOffsets[input.timezone] || -300;
+        let timezoneOffset: number;
+        try {
+          timezoneOffset = referenceUtcOffsetMinutes(input.timezone);
+        } catch {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Select a valid IANA timezone" });
+        }
 
         const newStore = await db.createStore({
           userId: ctx.user.id,
@@ -243,19 +245,33 @@ export const appRouter = router({
         z.object({
           id: z.number(),
           name: z.string().optional(),
+          timezone: z.string().optional(),
           timezoneOffset: z.number().optional(),
         })
       )
       .mutation(async ({ ctx, input }) => {
         const store = await db.getStoreById(input.id);
-        if (!store || store.userId !== ctx.user.id) {
-          throw new Error("Store not found or access denied");
-        }
+          if (!store || store.userId !== ctx.user.id) {
+            throw new Error("Store not found or access denied");
+          }
 
-        await db.updateStore(input.id, {
-          name: input.name,
-          timezoneOffset: input.timezoneOffset,
-        });
+          if (input.timezoneOffset !== undefined && input.timezone === undefined) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "Update the IANA timezone, not only its obsolete UTC offset" });
+          }
+          let timezoneOffset: number | undefined;
+          if (input.timezone !== undefined) {
+            try {
+              timezoneOffset = referenceUtcOffsetMinutes(input.timezone);
+            } catch {
+              throw new TRPCError({ code: "BAD_REQUEST", message: "Select a valid IANA timezone" });
+            }
+          }
+
+          await db.updateStore(input.id, {
+            name: input.name,
+            timezone: input.timezone,
+            timezoneOffset,
+          });
 
         return { success: true };
       }),
@@ -286,7 +302,8 @@ export const appRouter = router({
         const store = await db.getStoreById(input.storeId);
         if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: "NOT_FOUND" });
         const domain = normalizeShopDomain(input.shopDomain);
-        // Verify token works by making a test API call
+        // Verify store identity as well as the specific financial capabilities
+        // the profit calculation needs. A valid shop.json token alone is not enough.
         const testUrl = `https://${domain}/admin/api/2026-07/shop.json`;
         const response = await fetch(testUrl, {
           headers: {
@@ -301,11 +318,22 @@ export const appRouter = router({
           });
         }
 
+        const shop = (await response.json()).shop;
+        if (normalizeShopDomain(shop?.myshopify_domain || "") !== domain) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Shopify token belongs to a different store" });
+        }
+        let grantedScopes: string;
+        try {
+          grantedScopes = await verifyShopifyFinancialAccess(domain, input.accessToken);
+        } catch (error) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: (error as Error).message });
+        }
+
         await db.upsertShopifyConnection({
           storeId: input.storeId,
           shopDomain: domain,
           accessToken: input.accessToken,
-          scopes: "read_orders,read_products,read_customers,read_shopify_payments_disputes",
+          scopes: grantedScopes,
           apiVersion: "2026-07",
         });
 
@@ -583,229 +611,238 @@ export const appRouter = router({
       }),
 
     getProfit: protectedProcedure
-      .input(
-        z.object({
-          storeId: z.number(),
-          fromDate: z.string(),
-          toDate: z.string(),
-        })
-      )
+      .input(z.object({
+        storeId: z.number(),
+        fromDate: z.string(),
+        toDate: z.string(),
+      }))
       .query(async ({ ctx, input }) => {
+        try {
+          validateDateRange({ fromDate: input.fromDate, toDate: input.toDate });
+        } catch (error) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: (error as Error).message });
+        }
         const store = await db.getStoreById(input.storeId);
         if (!store || store.userId !== ctx.user.id) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Store not found or access denied",
-          });
+          throw new TRPCError({ code: "NOT_FOUND", message: "Store not found or access denied" });
         }
-
         const shopifyConn = await db.getShopifyConnectionByStoreId(input.storeId);
         const facebookConns = await db.getFacebookConnectionsByStoreId(input.storeId);
-
-        // Initialize with zero values
-        let orders: any[] = [];
-        let disputes = { totalAmount: 0, count: 0, wonAmount: 0, wonCount: 0, lostAmount: 0, lostCount: 0, pendingAmount: 0, pendingCount: 0 };
-        let processed: any = { revenue: 0, totalCogs: 0, totalShipping: 0, ordersCount: 0, processedOrders: [] };
+        const rate = await getEurUsdRate();
+        const warnings: string[] = [];
+        let processed: ReturnType<typeof processOrders> = {
+          revenue: 0, ordersCount: 0, totalCogs: 0, totalShipping: 0, processedOrders: [],
+        };
+        let cases: DisputeSummary = {
+          count: 0, wonCount: 0, lostCount: 0, acceptedCount: 0,
+          refundedCount: 0, pendingCount: 0, preventedCount: 0,
+          amountsByCurrency: {},
+        };
         let processingFees = 0;
-        let totalDisputeValue = 0; // Initialize dispute value from balance transactions
-        let totalDisputeFees = 0; // Initialize dispute fees from balance transactions
-        let totalDisputeRecovered = 0; // Initialize recovered amount from won chargebacks
-        let totalDisputeFeesRecovered = 0; // Initialize recovered fees from won chargebacks
-        let totalRefunds = 0; // Initialize refunds from balance transactions
-        let orderFees: Map<number, number> | undefined; // Declare at higher scope for debug access
-        let balancePageCount = 0; // Number of pages fetched from balance transactions API
+        let disputeValue = 0;
+        let disputeFees = 0;
+        let disputeRecovered = 0;
+        let disputeFeesRecovered = 0;
+        let refunds = 0;
+        let ledgerPages = 0;
+        let unclassifiedTypes: string[] = [];
+        let unreconciledLedgerNet = 0;
+        let unreconciledLedgerCount = 0;
+        let fxApproximate = false;
+        let perOrderFeeEstimates = 0;
 
-        // Get exchange rate for EUR to USD conversion
-        const EXCHANGE_RATE_EUR_USD = await getEurUsdRate();
-
-        // Fetch Shopify data if connected
         if (shopifyConn) {
-          orders = await fetchShopifyOrders(
-            shopifyConn.shopDomain,
-            shopifyConn.accessToken,
-            { fromDate: input.fromDate, toDate: input.toDate },
-            store.timezoneOffset || -300,
-            shopifyConn.apiVersion || "2026-07"
-          );
-
-          disputes = await fetchShopifyDisputes(
-            shopifyConn.shopDomain,
-            shopifyConn.accessToken,
-            { fromDate: input.fromDate, toDate: input.toDate },
-            store.timezoneOffset || -300,
-            shopifyConn.apiVersion || "2026-07"
-          );
-
-          const cogsConfigList = await db.getCogsConfigByStoreId(input.storeId);
-          const shippingConfigList = await db.getShippingConfigByStoreId(input.storeId);
-
-          const cogsMap: Record<string, number> = {};
-          for (const config of cogsConfigList) {
-            const val = parseFloat(config.cogsValue);
-            if (!isNaN(val)) {
-              cogsMap[config.variantId] = val;
-            }
+          if (store.currency !== "USD") {
+            throw new Error(`Store currency ${store.currency} is not supported for a USD profit dashboard`);
           }
-          console.log(`[COGS] Loaded ${Object.keys(cogsMap).length} COGS configurations:`, Object.keys(cogsMap).slice(0, 5));
+          const period = { fromDate: input.fromDate, toDate: input.toDate };
+          const offset = store.timezoneOffset ?? -300;
+          const version = shopifyConn.apiVersion || "2026-07";
+          assertOrderHistoryAccess(period, shopifyConn.scopes, offset, store.timezone);
+          const orders = await fetchShopifyOrders(
+            shopifyConn.shopDomain, shopifyConn.accessToken, period,
+            offset, version, store.timezone);
+          // Dispute status identifies the case's outcome; its disputed face
+          // amount is NOT a payment debit, a recovered amount, or a fee.
+          cases = await fetchShopifyDisputes(
+            shopifyConn.shopDomain, shopifyConn.accessToken, period,
+            offset, version, store.timezone);
+          // Any denial, malformed response, or incomplete pagination is fatal:
+          // zeros would incorrectly certify missing refunds/fees as none.
+          const ledger = await fetchShopifyBalanceTransactions(
+            shopifyConn.shopDomain, shopifyConn.accessToken, period,
+            version, rate, offset, store.timezone);
+          disputeValue = ledger.totalDisputeValue;
+          disputeFees = ledger.totalDisputeFees;
+          disputeRecovered = ledger.totalDisputeRecovered;
+          disputeFeesRecovered = ledger.totalDisputeFeesRecovered;
+          refunds = ledger.totalRefunds;
+          ledgerPages = ledger.pageCount;
+          unclassifiedTypes = ledger.unclassifiedTypes;
+          unreconciledLedgerNet = ledger.unclassifiedSignedNet;
+          unreconciledLedgerCount = ledger.unclassifiedCount;
+          fxApproximate = ledger.fxApproximate;
+          warnings.push("The Shopify Payments ledger does not contain fees, refunds or disputes from PayPal or other outside payment gateways. Reconcile those separately if used.");
+          // Charge fees and refund fee adjustments are recognized on their
+          // balance-transaction processed_at date, including for old orders.
+          processingFees = ledger.chargeFeesTotal + ledger.refundFeeAdjustments;
+          if (ledger.holdMovement !== 0) {
+            warnings.push("Shopify held/released funds are excluded from operating profit; they are not a finalized loss.");
+          }
+          if (unclassifiedTypes.length) {
+            warnings.push(`${unreconciledLedgerCount} Shopify Payments ledger entries (signed net ${unreconciledLedgerNet.toFixed(2)} USD) were excluded because their operating-profit treatment is unknown: ${unclassifiedTypes.join(", ")}. Reconcile these postings before relying on profit.`);
+          }
+          if (fxApproximate) {
+            warnings.push("EUR balance entries were converted to USD at today's rate; this is an estimate, not historical settlement FX.");
+          }
 
+          const [cogsConfigs, shippingConfigs, feeConfig] = await Promise.all([
+            db.getCogsConfigByStoreId(input.storeId),
+            db.getShippingConfigByStoreId(input.storeId),
+            db.getProcessingFeesConfigByStoreId(input.storeId),
+          ]);
+          const cogsMap: Record<string, number> = {};
+          for (const config of cogsConfigs) {
+            const amount = Number(config.cogsValue);
+            if (!Number.isFinite(amount) || amount < 0) throw new Error("Invalid configured COGS");
+            const currency = (config.currency || "USD").toUpperCase();
+            if (currency === "USD") cogsMap[config.variantId] = amount;
+            else if (currency === "EUR") {
+              cogsMap[config.variantId] = amount * rate;
+              fxApproximate = true;
+            } else throw new Error(`Unsupported configured COGS currency: ${currency}`);
+          }
           const shippingMap: Record<string, any> = {};
-          for (const config of shippingConfigList) {
+          for (const config of shippingConfigs) {
             try {
               shippingMap[config.variantId] = JSON.parse(config.configJson || "{}");
-            } catch (e) {
-              console.error("Failed to parse shipping config:", e);
+            } catch {
+              throw new Error("A stored shipping-cost configuration is invalid; profit cannot be verified");
+            }
+            if (shippingMap[config.variantId]?.currency === "EUR") fxApproximate = true;
+          }
+          if (fxApproximate && !warnings.some(message => message.includes("today's rate"))) {
+            warnings.push("EUR costs were converted to USD at today's rate; this is not historical settlement FX.");
+          }
+          const percentFee = Number(feeConfig?.percentFee ?? "0.028");
+          const fixedFee = Number(feeConfig?.fixedFee ?? "0.29");
+          if (!Number.isFinite(percentFee) || percentFee < 0 || !Number.isFinite(fixedFee) || fixedFee < 0) {
+            throw new Error("Invalid configured fallback processing fee");
+          }
+          processed = processOrders(
+            orders, cogsMap, shippingMap, rate, ledger.orderFees, percentFee, fixedFee);
+          let missingCogs = 0;
+          let missingShipping = 0;
+          for (const order of processed.processedOrders) {
+            for (const item of order.items) {
+              const key = String(item.variant_id ?? item.product_id ?? item.title ?? item.name ?? "");
+              if (!Object.prototype.hasOwnProperty.call(cogsMap, key)) missingCogs++;
+              if (order.region && !Object.prototype.hasOwnProperty.call(shippingMap, key)) missingShipping++;
             }
           }
-          console.log(`[Shipping] Loaded ${Object.keys(shippingMap).length} shipping configurations:`, Object.keys(shippingMap).slice(0, 5));
-
-          // Fetch actual processing fees and disputes from Shopify balance transactions
-          // NOTE: This may take 10-30 seconds depending on transaction volume
-          try {
-            const balanceData = await fetchShopifyBalanceTransactions(
-              shopifyConn.shopDomain,
-              shopifyConn.accessToken,
-              { fromDate: input.fromDate, toDate: input.toDate },
-              shopifyConn.apiVersion || "2026-07",
-              EXCHANGE_RATE_EUR_USD,
-              store.timezoneOffset || -300 // Use store's timezone offset
-            );
-            orderFees = balanceData.orderFees;
-            totalDisputeValue = balanceData.totalDisputeValue;
-            totalDisputeFees = balanceData.totalDisputeFees;
-            totalDisputeRecovered = balanceData.totalDisputeRecovered;
-            totalDisputeFeesRecovered = balanceData.totalDisputeFeesRecovered;
-            totalRefunds = balanceData.totalRefunds;
-            balancePageCount = balanceData.pageCount;
-            console.log(`[Balance Transactions] Fetched fees for ${orderFees.size} orders, dispute value: $${totalDisputeValue.toFixed(2)}, dispute fees: $${totalDisputeFees.toFixed(2)}, recovered: $${totalDisputeRecovered.toFixed(2)}, refunds: $${totalRefunds.toFixed(2)}`);
-          } catch (error) {
-            console.error("Failed to fetch balance transactions, using calculated fees:", error);
+          if (missingCogs) warnings.push(`${missingCogs} line items have no configured COGS; their actual product cost is not included.`);
+          if (missingShipping) warnings.push(`${missingShipping} line items have no configured shipping profile; verify actual fulfillment costs.`);
+          const cancelledUnfulfilled = orders.filter(order =>
+            order.cancelled_at && order.fulfillment_status !== "fulfilled" &&
+            !order.test && ["paid", "partially_refunded", "refunded"].includes(order.financial_status || "")
+          ).length;
+          if (cancelledUnfulfilled) {
+            warnings.push(`${cancelledUnfulfilled} paid orders were cancelled before full fulfillment. Their configured COGS/shipping remain estimates; reconcile returned inventory and labels manually.`);
           }
-          
-          // Debug: Log first order's variant IDs
-          if (orders.length > 0 && orders[0].line_items?.length > 0) {
-            const firstOrderVariants = orders[0].line_items.map((item: any) => `${item.variant_id} (${typeof item.variant_id})`);
-            console.log(`[Orders] First order variant IDs:`, firstOrderVariants);
+          const excludedOrders = orders.length - processed.ordersCount;
+          if (excludedOrders) warnings.push(`${excludedOrders} unpaid, voided, test or otherwise unsupported orders were excluded from sales.`);
+          perOrderFeeEstimates = processed.processedOrders.filter(
+            order => order.processingFeeSource === "estimated").length;
+          if (perOrderFeeEstimates) {
+            warnings.push(`${perOrderFeeEstimates} per-order fee figures are estimates; period processing fees use actual posted Shopify Payments fees only. Other payment gateways are not included.`);
           }
-          
-          processed = processOrders(orders, cogsMap, shippingMap, EXCHANGE_RATE_EUR_USD, orderFees);
-
-          const processingFeesConfig = await db.getProcessingFeesConfigByStoreId(input.storeId);
-          const percentFee = processingFeesConfig ? parseFloat(processingFeesConfig.percentFee || "0.028") : 0.028;
-          const fixedFee = processingFeesConfig ? parseFloat(processingFeesConfig.fixedFee || "0.29") : 0.29;
-          processingFees = calculateProcessingFees(processed.revenue, processed.ordersCount, percentFee, fixedFee);
+        } else {
+          warnings.push("Connect this store to Shopify to fetch orders, payment fees, refunds and disputes. Zero is not a verified profit figure.");
         }
 
-        // Fetch Facebook ad spend if connected
-        let totalAdSpend = 0;
-        for (const fbConn of facebookConns) {
-          const { spend, currency } = await fetchFacebookAdSpend(
-            fbConn.adAccountId,
-            fbConn.accessToken,
+        if (facebookConns.length === 0) {
+          warnings.push("No Facebook ad account is connected; any Meta ad spend is excluded from profit.");
+        }
+
+        let adSpend = 0;
+        for (const connection of facebookConns) {
+          const result = await fetchFacebookAdSpend(
+            connection.adAccountId, connection.accessToken,
             { fromDate: input.fromDate, toDate: input.toDate },
-            fbConn.apiVersion || "v25.0"
-          );
-
-          if (currency === "USD") {
-            totalAdSpend += spend / EXCHANGE_RATE_EUR_USD;
-          } else {
-            totalAdSpend += spend;
-          }
+            connection.apiVersion || "v25.0");
+          if (result.currency === "USD") adSpend += result.spend;
+          else if (result.currency === "EUR") adSpend += result.spend * rate;
+          else throw new Error(`Unsupported ad-account currency: ${result.currency}`);
         }
-
         const expenses = await db.getOperationalExpensesByStoreId(input.storeId);
-        const fromDateObj = new Date(input.fromDate);
-        const toDateObj = new Date(input.toDate);
-        const operationalExpensesTotal = calculateOperationalExpensesForPeriod(
-          expenses.map((e) => ({
-            type: e.type,
-            amount: parseFloat(e.amount),
-            date: e.date,
-            startDate: e.startDate,
-            endDate: e.endDate,
+        const operationalExpenses = calculateOperationalExpensesForPeriod(
+          expenses.map(expense => ({
+            type: expense.type,
+            amount: Number(expense.amount),
+            date: expense.date,
+            startDate: expense.startDate,
+            endDate: expense.endDate,
           })),
-          fromDateObj,
-          toDateObj
-        );
-
-        // Keep values in USD
-        const revenueUSD = processed.revenue;
-        const cogsUSD = processed.totalCogs;
-        const shippingUSD = processed.totalShipping;
-        const processingFeesUSD = processingFees;
-        // Use Disputes API for won/lost amounts (more reliable than balance transaction signs)
-        // disputes.lostAmount = disputes with status "lost" (money taken from you)
-        // disputes.wonAmount = disputes with status "won" (money returned to you)
-        const disputeValueUSD = disputes.lostAmount; // Lost chargebacks from Disputes API
-        
-        // Hardcoded €15 dispute fee per dispute (Shopify standard fee)
-        const DISPUTE_FEE_EUR = 15;
-        const disputeFeesUSD = disputes.lostCount * DISPUTE_FEE_EUR * EXCHANGE_RATE_EUR_USD; // €15 per lost dispute
-        const disputeRecoveredUSD = disputes.wonAmount; // Won chargebacks from Disputes API
-        const disputeFeesRecoveredUSD = disputes.wonCount * DISPUTE_FEE_EUR * EXCHANGE_RATE_EUR_USD; // €15 recovered per won dispute
-        
-        const totalDisputesUSD = disputeValueUSD + disputeFeesUSD; // Total disputes impact (not including recovered)
-        const totalRecoveredUSD = disputeRecoveredUSD + disputeFeesRecoveredUSD; // Total recovered from won chargebacks
-        
-        console.log(`[Disputes Final] Lost: $${disputeValueUSD.toFixed(2)} (${disputes.lostCount} disputes, fee: $${disputeFeesUSD.toFixed(2)}), Won: $${disputeRecoveredUSD.toFixed(2)} (${disputes.wonCount} disputes, fee recovered: $${disputeFeesRecoveredUSD.toFixed(2)})`);
-        const refundsUSD = totalRefunds; // Total refunds from balance transactions
-        
-        // Convert ad spend to USD if it was in EUR
-        const adSpendUSD = totalAdSpend * EXCHANGE_RATE_EUR_USD;
-        
-        // Operational expenses are already in USD (converted when saved)
-        const operationalExpensesUSD = operationalExpensesTotal;
-
-        // Profit formula: Only subtract Lost Disputes
-        // Won disputes don't affect profit because the revenue was never removed
-        // (Revenue already includes all completed orders, won disputes just mean you kept that revenue)
-        const netProfitUSD =
-          revenueUSD -
-          cogsUSD -
-          shippingUSD -
-          processingFeesUSD -
-          adSpendUSD -
-          totalDisputesUSD - // Lost disputes (value + fees) - money actually taken from you
-          refundsUSD -
-          operationalExpensesUSD;
-        // Note: Won disputes (totalRecoveredUSD) are NOT added back because revenue was never deducted
-
-        // Calculate average order profit margin (average of individual order margins)
-        let averageOrderProfitMargin = 0;
-        let averageOrderProfit = 0;
-        if (processed.processedOrders && processed.processedOrders.length > 0) {
-          const orderMargins = processed.processedOrders.map((order: any) => {
-            const orderRevenue = order.total;
-            const orderProfit = order.profit;
-            return orderRevenue > 0 ? (orderProfit / orderRevenue) * 100 : 0;
-          });
-          averageOrderProfitMargin = orderMargins.reduce((sum: number, margin: number) => sum + margin, 0) / orderMargins.length;
-          
-          // Calculate average order profit (average of individual order profits)
-          const orderProfits = processed.processedOrders.map((order: any) => order.profit);
-          averageOrderProfit = orderProfits.reduce((sum: number, profit: number) => sum + profit, 0) / orderProfits.length;
-        }
-
-        // Calculate ROAS (Return on Ad Spend)
-        const roas = adSpendUSD > 0 ? revenueUSD / adSpendUSD : 0;
-
+          new Date(`${input.fromDate}T00:00:00Z`),
+          new Date(`${input.toDate}T00:00:00Z`));
+        const breakdown = calculateProfitBreakdown({
+          revenue: processed.revenue,
+          cogs: processed.totalCogs,
+          shipping: processed.totalShipping,
+          processingFees,
+          adSpend,
+          operationalExpenses,
+          refunds,
+          disputeValue,
+          disputeFees,
+          disputeRecovered,
+          disputeFeesRecovered,
+        });
+        const orderProfits = processed.processedOrders.map(order => order.profit);
+        const orderMargins = processed.processedOrders.map(
+          order => order.total > 0 ? order.profit / order.total * 100 : 0);
+        const count = processed.ordersCount;
         return {
-          revenue: revenueUSD,
-          orders: processed.ordersCount,
-          cogs: cogsUSD,
-          shipping: shippingUSD,
-          processingFees: processingFeesUSD,
-          adSpend: adSpendUSD,
-          disputeValue: disputeValueUSD,
-          disputeFees: disputeFeesUSD,
-          disputeRecovered: disputeRecoveredUSD,
-          disputeFeesRecovered: disputeFeesRecoveredUSD,
-          refunds: refundsUSD,
-          operationalExpenses: operationalExpensesUSD,
-          netProfit: netProfitUSD,
+          revenue: processed.revenue,
+          orders: count,
+          cogs: processed.totalCogs,
+          shipping: processed.totalShipping,
+          processingFees,
+          adSpend,
+          disputeValue,
+          disputeFees,
+          disputeRecovered,
+          disputeFeesRecovered,
+          refunds,
+          operationalExpenses,
+          exchangeRateUsed: rate,
+          totalCosts: breakdown.totalCosts,
+          netProfit: breakdown.netProfit,
           processedOrders: processed.processedOrders,
-          averageOrderProfitMargin: averageOrderProfitMargin,
-          averageOrderProfit: averageOrderProfit,
-          roas: roas,
+          averageOrderProfitMargin: count ? orderMargins.reduce((a, b) => a + b, 0) / count : 0,
+          averageOrderProfit: count ? orderProfits.reduce((a, b) => a + b, 0) / count : 0,
+          roas: adSpend > 0 ? processed.revenue / adSpend : 0,
+          disputeCases: {
+            won: cases.wonCount,
+            lost: cases.lostCount,
+            accepted: cases.acceptedCount,
+            pending: cases.pendingCount,
+            refunded: cases.refundedCount,
+            prevented: cases.preventedCount,
+            nominalAmountsByCurrency: cases.amountsByCurrency,
+          },
+          dataQuality: {
+            shopifyConnected: !!shopifyConn,
+            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !fxApproximate && !perOrderFeeEstimates,
+            ledgerPages,
+            fxApproximate,
+            perOrderFeeEstimates,
+            unclassifiedTypes,
+            unreconciledLedgerNet,
+            unreconciledLedgerCount,
+            warnings,
+            basis: "Orders by created date; fees/refunds/dispute debits and credits by Shopify Payments processed date",
+          },
         };
       }),
 
@@ -1101,64 +1138,56 @@ export const appRouter = router({
           return [];
         }
 
+        assertOrderHistoryAccess(
+          { fromDate: input.startDate, toDate: input.endDate },
+          shopifyConn.scopes, store.timezoneOffset ?? -300, store.timezone
+        );
+
         const orders = await fetchShopifyOrders(
           shopifyConn.shopDomain,
           shopifyConn.accessToken,
           { fromDate: input.startDate, toDate: input.endDate },
-          store.timezoneOffset || -300,
-          shopifyConn.apiVersion || "2026-07"
+          store.timezoneOffset ?? -300,
+          shopifyConn.apiVersion || "2026-07",
+          store.timezone
         );
 
         const cogsConfigList = await db.getCogsConfigByStoreId(input.storeId);
         const shippingConfigList = await db.getShippingConfigByStoreId(input.storeId);
         const processingFeesConfig = await db.getProcessingFeesConfigByStoreId(input.storeId);
+        const rate = await getEurUsdRate();
 
         const cogsMap: Record<string, number> = {};
         for (const config of cogsConfigList) {
-          const val = parseFloat(config.cogsValue);
-          if (!isNaN(val)) {
-            cogsMap[config.variantId] = val;
-          }
+          const amount = Number(config.cogsValue);
+          if (!Number.isFinite(amount) || amount < 0) throw new Error("Invalid configured COGS");
+          const currency = (config.currency || "USD").toUpperCase();
+          if (currency !== "USD" && currency !== "EUR") throw new Error(`Unsupported COGS currency: ${currency}`);
+          cogsMap[config.variantId] = currency === "EUR" ? amount * rate : amount;
         }
 
         const shippingMap: Record<string, any> = {};
         for (const config of shippingConfigList) {
           try {
             shippingMap[config.variantId] = JSON.parse(config.configJson);
-          } catch {}
+          } catch {
+            throw new Error("Invalid configured shipping cost");
+          }
         }
 
-        // Fetch actual processing fees and disputes from Shopify balance transactions
-        // NOTE: This may take 10-30 seconds depending on transaction volume
-        let orderFees: Map<number, number> | undefined;
-        let balancePageCount = 0;
-        try {
-          // Get exchange rate for EUR to USD conversion (balance transactions return EUR)
-          const EXCHANGE_RATE_EUR_USD = await getEurUsdRate();
-          const balanceData = await fetchShopifyBalanceTransactions(
-            shopifyConn.shopDomain,
-            shopifyConn.accessToken,
-            { fromDate: input.startDate, toDate: input.endDate },
-            shopifyConn.apiVersion || "2026-07",
-            EXCHANGE_RATE_EUR_USD,
-            store.timezoneOffset || -300 // Use store's timezone offset
-          );
-          orderFees = balanceData.orderFees;
-          balancePageCount = balanceData.pageCount;
-          // Note: disputes are not used in orders list, only in dashboard
-          console.log(`[Balance Transactions] Fetched fees for ${orderFees.size} orders from ${balancePageCount} pages`);
-        } catch (error) {
-          console.error("Failed to fetch balance transactions, using calculated fees:", error);
-        }
-
-        // Get exchange rate for shipping cost conversion and currency conversion
-        const EXCHANGE_RATE_EUR_USD = await getEurUsdRate();
-        const processed = processOrders(orders, cogsMap, shippingMap, EXCHANGE_RATE_EUR_USD, orderFees);
-        const processingFees = calculateProcessingFees(
-          processed.revenue,
-          processed.ordersCount,
-          parseFloat(processingFeesConfig?.percentFee || "0.028"),
-          parseFloat(processingFeesConfig?.fixedFee || "0.29")
+        const ledger = await fetchShopifyBalanceTransactions(
+          shopifyConn.shopDomain,
+          shopifyConn.accessToken,
+          { fromDate: input.startDate, toDate: input.endDate },
+          shopifyConn.apiVersion || "2026-07",
+          rate,
+          store.timezoneOffset ?? -300,
+          store.timezone
+        );
+        const processed = processOrders(
+          orders, cogsMap, shippingMap, rate, ledger.orderFees,
+          Number(processingFeesConfig?.percentFee ?? "0.028"),
+          Number(processingFeesConfig?.fixedFee ?? "0.29")
         );
 
         // Calculate per-order profit in USD
@@ -1169,7 +1198,7 @@ export const appRouter = router({
           const orderTip = order.tip || 0;
           const orderCogs = order.cogs;
           const orderShipping = order.shippingCost;
-          const orderProcessingFee = order.processingFees || ((order.total * parseFloat(processingFeesConfig?.percentFee || "0.028")) + parseFloat(processingFeesConfig?.fixedFee || "0.29"));
+          const orderProcessingFee = order.processingFees;
           // Profit = Total Revenue - COGS - Shipping Cost - Processing Fees
           // Note: orderTotal already includes everything customer paid (products + shipping + tip - discounts)
           const orderProfit = orderTotal - orderCogs - orderShipping - orderProcessingFee;
@@ -1187,6 +1216,7 @@ export const appRouter = router({
             totalCogs: orderCogs,
             totalShipping: orderShipping,
             totalProcessingFees: orderProcessingFee,
+            processingFeeSource: order.processingFeeSource,
             profit: orderProfit,
             lineItems: (order.items || []).map((item: any) => {
               // Keep values in USD

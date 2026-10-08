@@ -9,6 +9,16 @@ export function validateRuntimeConfiguration(): void {
       throw new Error("incomplete database URI");
     }
   } catch {
+    let parsed: URL | undefined;
+    try { parsed = new URL(databaseUrl || ""); } catch { /* report only safe shape flags */ }
+    console.error("Beprofit database configuration shape:", JSON.stringify({
+      present: Boolean(databaseUrl),
+      parseable: Boolean(parsed),
+      postgresScheme: ["postgres:", "postgresql:"].includes(parsed?.protocol || ""),
+      hostPresent: Boolean(parsed?.hostname),
+      usernamePresent: Boolean(parsed?.username),
+      passwordPresent: Boolean(parsed?.password),
+    }));
     throw new Error("DATABASE_URL must be a private PostgreSQL connection URI");
   }
 

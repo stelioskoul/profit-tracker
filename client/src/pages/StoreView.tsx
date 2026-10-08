@@ -17,6 +17,7 @@ import Orders from "./Orders";
 import Settings from "./Settings";
 import ShippingProfiles from "./ShippingProfiles";
 import ExchangeRateDisplay from "@/components/ExchangeRateDisplay";
+import { todayInStore } from "@/lib/store-date";
 
 
 export default function StoreView() {
@@ -32,21 +33,24 @@ export default function StoreView() {
   // Default to today only (not last 30 days)
   const [startDate, setStartDate] = useState(todayString);
   const [endDate, setEndDate] = useState(todayString);
+  const [userSelectedRange, setUserSelectedRange] = useState(false);
 
   const { data: store, isLoading: storeLoading } = trpc.stores.getById.useQuery(
     { id: storeId },
     { enabled: isAuthenticated && storeId > 0 }
   );
+  const storeToday = useMemo(() => todayInStore(store?.timezone), [store?.timezone]);
+  const selectedStartDate = userSelectedRange ? startDate : storeToday;
+  const selectedEndDate = userSelectedRange ? endDate : storeToday;
 
   const { data: metrics, isLoading: metricsLoading, error, refetch } = trpc.metrics.getProfit.useQuery(
-    { storeId, fromDate: startDate, toDate: endDate },
-    { enabled: isAuthenticated && storeId > 0, retry: false }
+    { storeId, fromDate: selectedStartDate, toDate: selectedEndDate },
+    { enabled: isAuthenticated && storeId > 0 && !!store, retry: false }
   );
 
   // Removed caching - using direct getProfit for always fresh data
 
-  const { data: exchangeRateData } = trpc.exchangeRate.getCurrent.useQuery();
-  const exchangeRate = exchangeRateData?.rate || 1.1588;
+  const exchangeRate = metrics?.exchangeRateUsed ?? 1;
 
   if (loading || storeLoading) {
     return (
@@ -149,9 +153,13 @@ export default function StoreView() {
                 <input
                   type="date"
                   id="start-date"
-                  value={startDate}
-                  max={endDate}
-                  onChange={(e) => setStartDate(e.target.value)}
+                  value={selectedStartDate}
+                  max={selectedEndDate}
+                  onChange={(e) => {
+                    if (!userSelectedRange) setEndDate(storeToday);
+                    setStartDate(e.target.value);
+                    setUserSelectedRange(true);
+                  }}
                   className="px-3 py-2 rounded-md border border-border bg-black/30 text-foreground date-input-gold"
                   style={{ colorScheme: 'dark' }}
                 />
@@ -163,9 +171,13 @@ export default function StoreView() {
                 <input
                   type="date"
                   id="end-date"
-                  value={endDate}
-                  min={startDate}
-                  onChange={(e) => setEndDate(e.target.value)}
+                  value={selectedEndDate}
+                  min={selectedStartDate}
+                  onChange={(e) => {
+                    if (!userSelectedRange) setStartDate(storeToday);
+                    setEndDate(e.target.value);
+                    setUserSelectedRange(true);
+                  }}
                   className="px-3 py-2 rounded-md border border-border bg-black/30 text-foreground date-input-gold"
                   style={{ colorScheme: 'dark' }}
                 />
@@ -173,7 +185,7 @@ export default function StoreView() {
               {/* Date Range Presets Dropdown */}
               <Select
                 onValueChange={(value) => {
-                  const today = new Date();
+                  const today = new Date(`${storeToday}T12:00:00Z`);
                   let fromDate: Date;
                   let toDate: Date = new Date(today);
                   
@@ -183,40 +195,32 @@ export default function StoreView() {
                       break;
                     case 'yesterday':
                       fromDate = new Date(today);
-                      fromDate.setDate(today.getDate() - 1);
+                      fromDate.setUTCDate(today.getUTCDate() - 1);
                       toDate = new Date(fromDate);
                       break;
                     case 'last7':
                       fromDate = new Date(today);
-                      fromDate.setDate(today.getDate() - 6);
+                      fromDate.setUTCDate(today.getUTCDate() - 6);
                       break;
                     case 'last30':
                       fromDate = new Date(today);
-                      fromDate.setDate(today.getDate() - 29);
+                      fromDate.setUTCDate(today.getUTCDate() - 29);
                       break;
                     case 'thisMonth':
-                      // Create date for 1st of current month in local timezone
-                      fromDate = new Date(today.getFullYear(), today.getMonth(), 1);
+                      fromDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1, 12));
                       toDate = new Date(today);
                       break;
                     case 'lastMonth':
-                      fromDate = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-                      toDate = new Date(today.getFullYear(), today.getMonth(), 0);
+                      fromDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, 1, 12));
+                      toDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 0, 12));
                       break;
                     default:
                       return;
                   }
                   
-                  // Format dates in local timezone
-                  const formatDate = (d: Date) => {
-                    const year = d.getFullYear();
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const day = String(d.getDate()).padStart(2, '0');
-                    return `${year}-${month}-${day}`;
-                  };
-                  
-                  setStartDate(formatDate(fromDate));
-                  setEndDate(formatDate(toDate));
+                  setStartDate(fromDate.toISOString().slice(0, 10));
+                  setEndDate(toDate.toISOString().slice(0, 10));
+                  setUserSelectedRange(true);
                 }}
               >
                 <SelectTrigger className="w-[150px] h-9 bg-black/30 border-border">
@@ -249,7 +253,7 @@ export default function StoreView() {
                   </Button>
                   {/* Removed lastRefreshed display - no caching */}
                 </div>
-                <ExchangeRateDisplay />
+                <ExchangeRateDisplay rate={metrics?.exchangeRateUsed} />
               </div>
             </div>
 
@@ -266,8 +270,34 @@ export default function StoreView() {
                   </p>
                 </CardContent>
               </Card>
+            ) : metrics && !metrics.dataQuality.shopifyConnected ? (
+              <Card className="glass">
+                <CardContent className="space-y-4 p-6">
+                  <h2 className="text-lg font-semibold">Connect Shopify to calculate profit</h2>
+                  <p className="text-sm text-muted-foreground">
+                    This store has no Shopify connection. Zero sales, refunds and disputes are not verified figures.
+                    Connect the store and grant order, dispute and Shopify Payments payout access.
+                  </p>
+                  <Button onClick={() => setActiveTab("connections")}>Open Connections</Button>
+                </CardContent>
+              </Card>
             ) : metrics ? (
               <>
+                <p className="text-sm text-muted-foreground">
+                  Sales and product costs follow the order creation date; payment fees, refunds,
+                  dispute debits and recoveries follow Shopify Payments' processed date.
+                  Case outcomes below show their current status for disputes initiated in this range.
+                </p>
+                {metrics.dataQuality.warnings.length > 0 && (
+                  <Card className="glass border-amber-500/40">
+                    <CardContent className="p-4 space-y-2">
+                      <p className="font-semibold text-amber-400">Data limitations — profit may be incomplete</p>
+                      {metrics.dataQuality.warnings.map((warning, index) => (
+                        <p key={index} className="text-sm text-muted-foreground">{warning}</p>
+                      ))}
+                    </CardContent>
+                  </Card>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                   <Card className="card-glow">
                     <CardContent className="p-6">
@@ -283,19 +313,19 @@ export default function StoreView() {
 
                   <Card className="card-glow">
                     <CardContent className="p-6">
-                      <p className="text-sm text-muted-foreground mb-2">Total Costs</p>
+                      <p className="text-sm text-muted-foreground mb-2">Classified Costs</p>
                       <p className="text-3xl font-bold text-red-500">
-                        {formatCurrencyUSD(metrics.cogs + metrics.shipping + metrics.processingFees + (metrics.disputeValue || 0) + (metrics.disputeFees || 0) + (metrics.refunds || 0) + metrics.adSpend + metrics.operationalExpenses - (metrics.disputeRecovered || 0) - (metrics.disputeFeesRecovered || 0))}
+                        {formatCurrencyUSD(metrics.totalCosts)}
                       </p>
                       <p className="text-xs text-muted-foreground mt-1">
-                        {formatCurrencyEUR((metrics.cogs + metrics.shipping + metrics.processingFees + (metrics.disputeValue || 0) + (metrics.disputeFees || 0) + (metrics.refunds || 0) + metrics.adSpend + metrics.operationalExpenses - (metrics.disputeRecovered || 0) - (metrics.disputeFeesRecovered || 0)) / exchangeRate)}
+                        {formatCurrencyEUR(metrics.totalCosts / exchangeRate)}
                       </p>
                     </CardContent>
                   </Card>
 
                   <Card className="card-glow">
                     <CardContent className="p-6">
-                      <p className="text-sm text-muted-foreground mb-2">Net Profit</p>
+                      <p className="text-sm text-muted-foreground mb-2">Estimated Operating Profit</p>
                       <p className={`text-3xl font-bold ${metrics.netProfit >= 0 ? "text-green-500" : "text-red-500"}`}>
                         {formatCurrencyUSD(metrics.netProfit)}
                       </p>
@@ -347,7 +377,7 @@ export default function StoreView() {
                     <CardContent className="p-4 space-y-2">
                       <h3 className="font-semibold text-sm text-amber-500 mb-3">Transaction Fees</h3>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground text-sm">Processing Fees</span>
+                        <span className="text-muted-foreground text-sm">Posted Shopify Payments fees</span>
                         <div className="text-right">
                           <div className="font-semibold text-sm">{formatCurrencyUSD(metrics.processingFees)}</div>
                           <div className="text-xs text-muted-foreground">{formatCurrencyEUR(metrics.processingFees / exchangeRate)}</div>
@@ -403,10 +433,10 @@ export default function StoreView() {
                     </CardContent>
                   </Card>
 
-                  {/* Disputes Won */}
+                  {/* Actual dispute credits posted to the Shopify Payments ledger. */}
                   <Card className="glass">
                     <CardContent className="p-4 space-y-2">
-                      <h3 className="font-semibold text-sm text-green-500 mb-3">Disputes (Won)</h3>
+                      <h3 className="font-semibold text-sm text-green-500 mb-3">Dispute credits (posted)</h3>
                       <div className="flex items-center justify-between">
                         <span className="text-muted-foreground text-sm">Value Recovered</span>
                         <div className="text-right">
@@ -438,12 +468,12 @@ export default function StoreView() {
                     </CardContent>
                   </Card>
 
-                  {/* Disputes Lost */}
+                  {/* Debits can occur while a chargeback is still pending. */}
                   <Card className="glass">
                     <CardContent className="p-4 space-y-2">
-                      <h3 className="font-semibold text-sm text-red-500 mb-3">Disputes (Lost)</h3>
+                      <h3 className="font-semibold text-sm text-red-500 mb-3">Dispute debits (posted)</h3>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground text-sm">Value Lost</span>
+                        <span className="text-muted-foreground text-sm">Principal debited</span>
                         <div className="text-right">
                           <div className="font-semibold text-sm text-red-500">
                             -{formatCurrencyUSD(metrics.disputeValue || 0)}
@@ -454,7 +484,7 @@ export default function StoreView() {
                         </div>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground text-sm">Fees Lost</span>
+                        <span className="text-muted-foreground text-sm">Fees debited</span>
                         <div className="text-right">
                           <div className="font-semibold text-sm text-red-500">
                             -{formatCurrencyUSD(metrics.disputeFees || 0)}
@@ -473,6 +503,24 @@ export default function StoreView() {
                     </CardContent>
                   </Card>
                 </div>
+
+                <Card className="glass">
+                  <CardContent className="p-4 space-y-2">
+                    <h3 className="font-semibold text-sm text-amber-500">Dispute case outcomes</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Current status of cases initiated in this range — won: {metrics.disputeCases.won},
+                      lost: {metrics.disputeCases.lost}, accepted: {metrics.disputeCases.accepted},
+                      pending: {metrics.disputeCases.pending}, refunded: {metrics.disputeCases.refunded}.
+                      These case amounts are not additional payment transactions or profit.
+                    </p>
+                    {Object.entries(metrics.disputeCases.nominalAmountsByCurrency).map(([currency, amounts]) => (
+                      <p key={currency} className="text-xs text-muted-foreground">
+                        {currency} disputed face value — won: {new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amounts.won ?? 0)},
+                        lost: {new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amounts.lost ?? 0)}
+                      </p>
+                    ))}
+                  </CardContent>
+                </Card>
 
                 {/* Order Statistics */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -496,7 +544,7 @@ export default function StoreView() {
                         </div>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground">Average Profit per Order</span>
+                        <span className="text-muted-foreground">Average Profit per Order{metrics.dataQuality.perOrderFeeEstimates ? " (estimated fees)" : ""}</span>
                         <div className="text-right">
                           <div className="font-semibold">
                             {formatCurrencyUSD(metrics.averageOrderProfit || 0)}

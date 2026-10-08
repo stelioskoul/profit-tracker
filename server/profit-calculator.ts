@@ -32,6 +32,8 @@ interface ShopifyOrder {
   created_at: string;
   total_price: string;
   currency: string;
+  financial_status?: string | null;
+  test?: boolean;
   total_discounts?: string;
   customer?: {
     first_name?: string;
@@ -186,9 +188,12 @@ export function computeShippingForLineItem(
     }
   }
 
-  // Convert to USD if config is in EUR (for consistency, all costs returned in USD)
-  if (configCurrency === "EUR" && exchangeRate > 0) {
-    total = total * exchangeRate;
+  // The dashboard reports USD; mixing another currency as-is would be false.
+  if (configCurrency === "EUR") {
+    if (!Number.isFinite(exchangeRate) || exchangeRate <= 0) throw new Error("Invalid EUR/USD rate");
+    total *= exchangeRate;
+  } else if (configCurrency !== "USD") {
+    throw new Error(`Unsupported shipping cost currency: ${configCurrency}`);
   }
 
   return total;
@@ -208,6 +213,7 @@ export interface ProcessedOrder {
   cogs: number;
   shippingCost: number;
   processingFees: number;
+  processingFeeSource: "shopify" | "estimated";
   profit: number; // Added: total - cogs - shippingCost - processingFees
   shippingType: string;
   region: string | null;
@@ -219,7 +225,9 @@ export function processOrders(
   cogsConfig: CogsConfigMap,
   shippingConfig: ShippingConfigMap,
   exchangeRate: number = 1.0,
-  orderFees?: Map<number, number> // Map of order_id -> actual processing fee from Shopify
+  orderFees?: Map<number, number>, // order_id -> posted Shopify Payments charge fees
+  percentFee = 0.028,
+  fixedFee = 0.29
 ): {
   revenue: number;
   ordersCount: number;
@@ -233,10 +241,20 @@ export function processOrders(
   const processedOrders: ProcessedOrder[] = [];
 
   for (const order of orders) {
-    const val = parseFloat(order.total_price || "0");
-    if (!isNaN(val)) {
-      revenue += val;
+    // An authorization or uncollected order is not a completed sale. Keep an
+    // originally paid/refunded order's gross sale, then book its actual refund
+    // once on the ledger processing date.
+    if (order.test || ["pending", "authorized", "voided"].includes(order.financial_status || "")) continue;
+    if (order.financial_status === "partially_paid") {
+      throw new Error("Partially paid Shopify orders need captured-payment accounting before profit can be verified");
     }
+    if (!["paid", "partially_refunded", "refunded"].includes(order.financial_status || "")) {
+      throw new Error(`Shopify order has an unsupported payment status: ${order.financial_status ?? "missing"}`);
+    }
+    if (order.currency !== "USD") throw new Error(`Unsupported order currency: ${order.currency}`);
+    const val = Number(order.total_price);
+    if (!Number.isFinite(val) || val < 0) throw new Error("Shopify order has an invalid total price");
+    revenue += val;
 
     const shippingCountry = order.shipping_address?.country || null;
     const customerName =
@@ -256,20 +274,6 @@ export function processOrders(
     for (const item of lineItems) {
       const itemCogs = computeCogsForLineItem(item, cogsConfig);
       const itemShipping = region ? computeShippingForLineItem(item, region, shippingType, shippingConfig, exchangeRate) : 0;
-      
-      // Debug logging for first order
-      if (processedOrders.length === 0 && lineItems.indexOf(item) === 0) {
-        const key = getItemConfigKey(item);
-        console.log(`[Shipping Debug] Order ${order.order_number}:`);
-        console.log(`  - variant_id: ${item.variant_id} (${typeof item.variant_id})`);
-        console.log(`  - Config key: ${key}`);
-        console.log(`  - Has shipping config: ${!!shippingConfig[key!]}`);
-        console.log(`  - Region: ${region}, Shipping Type: ${shippingType}`);
-        console.log(`  - Calculated shipping: $${itemShipping}`);
-        if (shippingConfig[key!]) {
-          console.log(`  - Shipping config:`, JSON.stringify(shippingConfig[key!]).substring(0, 200));
-        }
-      }
       
       orderCogs += itemCogs;
       orderShipping += itemShipping;
@@ -303,20 +307,10 @@ export function processOrders(
       }
     }
     
-    // Use actual processing fees from Shopify balance transactions if available
-    // Otherwise fallback to calculated fees (2.8% + $0.29)
-    const orderIdNum = parseInt(order.id);
-    const orderProcessingFees = orderFees && orderFees.has(orderIdNum) 
-      ? orderFees.get(orderIdNum)! 
-      : val * 0.028 + 0.29;
-    
-    // Debug logging for order #11472
-    if (order.order_number === 11472) {
-      console.log(`[Order #11472] Internal ID: ${orderIdNum} (type: ${typeof orderIdNum}), Has fee data: ${orderFees?.has(orderIdNum)}, Fee: $${orderProcessingFees.toFixed(2)}`);
-      if (orderFees) {
-        console.log(`[Order #11472] orderFees map size: ${orderFees.size}, sample keys:`, Array.from(orderFees.keys()).slice(0, 5));
-      }
-    }
+    const orderIdNum = Number(order.id);
+    const actualFee = orderFees?.get(orderIdNum);
+    const processingFeeSource = actualFee !== undefined ? "shopify" : "estimated";
+    const orderProcessingFees = actualFee ?? val * percentFee + fixedFee;
     
     // Calculate profit for this order
     const orderProfit = val - orderCogs - orderShipping - orderProcessingFees;
@@ -335,6 +329,7 @@ export function processOrders(
       cogs: orderCogs,
       shippingCost: orderShipping,
       processingFees: orderProcessingFees,
+      processingFeeSource,
       profit: orderProfit,
       shippingType,
       region,
@@ -344,7 +339,7 @@ export function processOrders(
 
   return {
     revenue,
-    ordersCount: orders.length,
+    ordersCount: processedOrders.length,
     totalCogs,
     totalShipping,
     processedOrders,
@@ -358,6 +353,18 @@ export function calculateProcessingFees(
   fixedFee: number = 0.29
 ): number {
   return revenue * percentFee + ordersCount * fixedFee;
+}
+
+function anchoredCalendarOccurrence(start: Date, monthsSinceStart: number): Date {
+  const firstOfMonth = new Date(Date.UTC(
+    start.getUTCFullYear(), start.getUTCMonth() + monthsSinceStart, 1,
+    start.getUTCHours(), start.getUTCMinutes(), start.getUTCSeconds(), start.getUTCMilliseconds()
+  ));
+  const lastDay = new Date(Date.UTC(
+    firstOfMonth.getUTCFullYear(), firstOfMonth.getUTCMonth() + 1, 0
+  )).getUTCDate();
+  firstOfMonth.setUTCDate(Math.min(start.getUTCDate(), lastDay));
+  return firstOfMonth;
 }
 
 /**
@@ -399,20 +406,13 @@ export function calculateOperationalExpensesForPeriod(
       const start = new Date(expense.startDate);
       const end = expense.endDate ? new Date(expense.endDate) : new Date("2099-12-31"); // Far future if no end date
 
-      // Generate all monthly occurrences
-      let currentDate = new Date(start);
-      while (currentDate <= end && currentDate <= toDate) {
-        // Check if this occurrence falls in the query range
+      // Anchor on the original day: Jan 31 -> Feb 28 -> Mar 31.
+      for (let month = 0; month < 12000; month++) {
+        const currentDate = anchoredCalendarOccurrence(start, month);
+        if (currentDate > end || currentDate > toDate) break;
         if (currentDate >= fromDate && currentDate <= toDate) {
           total += expense.amount;
         }
-
-        // Move to next month (same day)
-        currentDate = new Date(currentDate);
-        currentDate.setMonth(currentDate.getMonth() + 1);
-
-        // If we've passed the start date, break
-        if (currentDate < start) break;
       }
     } else if (expense.type === "yearly") {
       // Yearly recurring: count once for each occurrence in range
@@ -421,20 +421,12 @@ export function calculateOperationalExpensesForPeriod(
       const start = new Date(expense.startDate);
       const end = expense.endDate ? new Date(expense.endDate) : new Date("2099-12-31"); // Far future if no end date
 
-      // Generate all yearly occurrences
-      let currentDate = new Date(start);
-      while (currentDate <= end && currentDate <= toDate) {
-        // Check if this occurrence falls in the query range
+      for (let year = 0; year < 1000; year++) {
+        const currentDate = anchoredCalendarOccurrence(start, year * 12);
+        if (currentDate > end || currentDate > toDate) break;
         if (currentDate >= fromDate && currentDate <= toDate) {
           total += expense.amount;
         }
-
-        // Move to next year (same month and day)
-        currentDate = new Date(currentDate);
-        currentDate.setFullYear(currentDate.getFullYear() + 1);
-
-        // If we've passed the start date, break
-        if (currentDate < start) break;
       }
     }
   }

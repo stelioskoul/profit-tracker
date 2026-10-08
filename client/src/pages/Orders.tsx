@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { getLoginUrl } from "@/const";
 import { trpc } from "@/lib/trpc";
+import { todayInStore } from "@/lib/store-date";
 import { Loader2 } from "lucide-react";
 import { useParams } from "wouter";
 import { useState } from "react";
@@ -18,11 +19,19 @@ export default function Orders() {
   
   const [startDate, setStartDate] = useState(today.toISOString().split("T")[0]);
   const [endDate, setEndDate] = useState(today.toISOString().split("T")[0]);
+  const [rangeTouched, setRangeTouched] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
-  const { data, isLoading } = trpc.orders.listWithProfit.useQuery(
-    { storeId, startDate, endDate },
-    { enabled: isAuthenticated && storeId > 0 }
+  const { data: store } = trpc.stores.getById.useQuery({ id: storeId }, {
+    enabled: isAuthenticated && storeId > 0,
+  });
+  const storeToday = todayInStore(store?.timezone);
+  const selectedStartDate = rangeTouched ? startDate : storeToday;
+  const selectedEndDate = rangeTouched ? endDate : storeToday;
+
+  const { data, isLoading, error } = trpc.orders.listWithProfit.useQuery(
+    { storeId, startDate: selectedStartDate, endDate: selectedEndDate },
+    { enabled: isAuthenticated && storeId > 0 && !!store, retry: false }
   );
   
   const orders = (data as any) || [];
@@ -75,7 +84,7 @@ export default function Orders() {
           <div>
             <h2 className="text-3xl font-bold gold-text">Orders</h2>
             <p className="text-muted-foreground mt-1">
-              View detailed profit breakdown for each order
+              Created-date order contribution; refunds and disputes post to the dashboard on their Shopify Payments transaction dates.
             </p>
           </div>
           <div className="flex items-center gap-4">
@@ -84,8 +93,13 @@ export default function Orders() {
               <Input
                 id="start-date"
                 type="date"
-                value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
+                value={selectedStartDate}
+                max={selectedEndDate}
+                onChange={(e) => {
+                  if (!rangeTouched) setEndDate(storeToday);
+                  setStartDate(e.target.value);
+                  setRangeTouched(true);
+                }}
                 className="w-40 date-input-gold"
               />
             </div>
@@ -94,8 +108,13 @@ export default function Orders() {
               <Input
                 id="end-date"
                 type="date"
-                value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
+                value={selectedEndDate}
+                min={selectedStartDate}
+                onChange={(e) => {
+                  if (!rangeTouched) setStartDate(storeToday);
+                  setEndDate(e.target.value);
+                  setRangeTouched(true);
+                }}
                 className="w-40 date-input-gold"
               />
             </div>
@@ -121,6 +140,10 @@ export default function Orders() {
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-8 w-8 animate-spin text-primary" />
         </div>
+      ) : error ? (
+        <Card className="border-red-500/40">
+          <CardContent className="py-6 text-red-300">Orders could not be verified: {error.message}</CardContent>
+        </Card>
       ) : orders && orders.length > 0 ? (
         <div className="space-y-4">
           {orders
@@ -150,7 +173,7 @@ export default function Orders() {
                     </div>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm text-muted-foreground">Net Profit</p>
+                    <p className="text-sm text-muted-foreground">Order Contribution</p>
                     <p className={`text-2xl font-bold ${getProfitColor(order.profit)}`}>
                       {formatCurrency(order.profit)}
                     </p>
@@ -184,13 +207,13 @@ export default function Orders() {
                           <p className="text-sm font-medium">{formatCurrency(item.discount || 0)}</p>
                         </div>
                         <div>
-                          <p className="text-xs text-muted-foreground">Net Profit Margin</p>
+                          <p className="text-xs text-muted-foreground">Item Contribution Margin*</p>
                           <p className={`text-sm font-semibold ${(item.quantity * item.price) > 0 ? (item.profit / (item.quantity * item.price) * 100) >= 0 ? "text-green-500" : "text-red-500" : "text-muted-foreground"}`}>
                             {(item.quantity * item.price) > 0 ? ((item.profit / (item.quantity * item.price)) * 100).toFixed(1) : "0.0"}%
                           </p>
                         </div>
                         <div>
-                          <p className="text-xs text-muted-foreground">Item Profit</p>
+                          <p className="text-xs text-muted-foreground">Item Contribution*</p>
                           <p className={`text-sm font-semibold ${getProfitColor(item.profit || 0)}`}>
                             {formatCurrency(item.profit || 0)}
                           </p>
@@ -223,7 +246,9 @@ export default function Orders() {
                       <p className="font-semibold">{formatCurrency(order.totalShipping)}</p>
                     </div>
                     <div>
-                      <p className="text-muted-foreground">Processing Fees</p>
+                      <p className="text-muted-foreground">
+                        Payment Fee ({order.processingFeeSource === "shopify" ? "posted" : "estimated"})
+                      </p>
                       <p className="font-semibold">{formatCurrency(order.totalProcessingFees)}</p>
                     </div>
                     <div>
@@ -233,6 +258,10 @@ export default function Orders() {
                       </p>
                     </div>
                   </div>
+                  <p className="text-xs text-muted-foreground mt-3">
+                    * Item contribution excludes order-level payment fees, shipping revenue and tips.
+                    Order contribution excludes later refunds, disputes, ad spend and operating expenses.
+                  </p>
                 </div>
               </CardContent>
             </Card>

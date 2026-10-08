@@ -2,7 +2,7 @@ import type { Express, Request, Response } from "express";
 import * as db from "../db";
 import { verifyOAuthState } from "../oauth-state";
 import { exchangeShopifyCode, normalizeShopDomain, verifyShopifyFinancialAccess, verifyShopifyHmac } from "../shopify-oauth";
-import { exchangeFacebookCode, prepareFacebookToken, getFacebookAdAccounts } from "../facebook-oauth";
+import { exchangeFacebookCode, prepareFacebookToken, getFacebookAdAccounts, FacebookPermissionError } from "../facebook-oauth";
 import { stageFacebookToken } from "../facebook-pending";
 import { getSessionUserId } from "./sdk";
 
@@ -76,7 +76,7 @@ export function registerOAuthRoutes(app: Express) {
       return res.redirect(302, `/store/${storeId}/connections?facebook=select`);
     } catch (error) {
       console.error("[Facebook OAuth] Callback rejected:", error instanceof Error ? error.message : "Invalid callback");
-      if (storeId) return res.redirect(302, `/store/${storeId}/connections?facebook=failed`);
+      if (storeId) return res.redirect(302, `/store/${storeId}/connections?facebook=${error instanceof FacebookPermissionError ? "permission_missing" : "failed"}`);
       return res.status(403).json({ error: "Facebook connection failed; sign in and retry" });
     }
   });

@@ -28,7 +28,7 @@ export default function Connections() {
   const [existingConnectionId, setExistingConnectionId] = useState("");
   const [facebookStatus, setFacebookStatus] = useState(() => new URLSearchParams(window.location.search).get("facebook"));
   useEffect(() => {
-    const messages: Record<string, string> = { cancelled: "Facebook login was cancelled. You can try again.", no_accounts: "No ad accounts were granted. Log in again and select your ad account.", failed: "Facebook connection failed. Check the app configuration and try again." };
+    const messages: Record<string, string> = { cancelled: "Facebook login was cancelled. You can try again.", no_accounts: "No ad accounts were granted. Log in again and select your ad account.", permission_missing: "Facebook did not grant read-only ads access. Connect again and allow ad-report access. If this continues, check the app's ads_read access level in Meta.", failed: "Facebook connection failed. Check the app configuration and try again." };
     if (facebookStatus && messages[facebookStatus]) toast.error(messages[facebookStatus]);
   }, [facebookStatus, storeId]);
 
@@ -307,6 +307,7 @@ export default function Connections() {
             </CardHeader>
             <CardContent>
               {pendingFacebookError && <p role="alert" className="text-sm text-destructive mb-4">{pendingFacebookError.message}</p>}
+              {facebookStatus === "permission_missing" && <p role="alert" className="text-sm text-destructive mb-4">Facebook did not grant read-only ads access. Connect again and allow ad-report access. If this continues, check the app's ads_read access level in Meta.</p>}
               {facebookStatus === "select" && pendingFacebook === null && <p role="alert" className="text-sm text-muted-foreground mb-4">Your Facebook login selection expired. Connect with Facebook OAuth again.</p>}
               {pendingFacebook && (
                 <div className="space-y-3 border rounded-lg p-4 mb-4">

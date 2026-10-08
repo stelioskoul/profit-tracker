@@ -15,14 +15,12 @@ function credentials() {
 
 export function getFacebookAuthUrl(redirectUri: string, state: string): string {
   const { appId } = credentials();
-  const params = new URLSearchParams({ client_id: appId, redirect_uri: redirectUri, state, response_type: "code" });
+  const params = new URLSearchParams({ client_id: appId, redirect_uri: redirectUri, state, response_type: "code", scope: "ads_read", auth_type: "rerequest" });
   const configurationId = process.env.FACEBOOK_LOGIN_CONFIG_ID?.trim();
   if (configurationId) {
     if (!/^\d+$/.test(configurationId)) throw new Error("The Facebook business login configuration ID is invalid.");
     params.set("config_id", configurationId);
     params.set("override_default_response_type", "true");
-  } else {
-    params.set("scope", "ads_read");
   }
   return `https://www.facebook.com/${FACEBOOK_API_VERSION}/dialog/oauth?${params}`;
 }
@@ -32,6 +30,12 @@ export class FacebookApiError extends Error {
     super(providerCode === 190
       ? "Facebook access expired or was revoked. Reconnect this ad account."
       : `Facebook API request failed (HTTP ${status}${providerCode ? `, code ${providerCode}` : ""}). Check the app's ad-account permissions.`);
+  }
+}
+
+export class FacebookPermissionError extends Error {
+  constructor() {
+    super("Facebook did not grant ads_read permission. Reconnect and allow read-only ad-report access.");
   }
 }
 
@@ -78,7 +82,19 @@ export async function inspectFacebookToken(token: string): Promise<FacebookToken
   const { data } = await facebookJson("debug_token", `${appId}|${appSecret}`, { input_token: token });
   if (!data?.is_valid) throw new Error("Facebook access expired or was revoked. Reconnect this ad account.");
   if (String(data.app_id) !== appId) throw new Error("This token belongs to a different Facebook app.");
-  if (!Array.isArray(data.scopes) || !data.scopes.includes("ads_read")) throw new Error("Facebook ads_read permission is missing. Reconnect and allow ad-report access.");
+  const scopes = Array.isArray(data.scopes) ? data.scopes : [];
+  const granularScopes = Array.isArray(data.granular_scopes) ? data.granular_scopes.map((item: any) => item?.scope) : [];
+  if (!scopes.includes("ads_read") && !granularScopes.includes("ads_read")) {
+    // Scope names and token type are safe diagnostics; never log the token,
+    // debug response, user identifiers, asset IDs, or provider URLs.
+    const safeScopes = (value: unknown) => Array.isArray(value) ? value.filter((scope): scope is string => typeof scope === "string" && /^[a-z_]{1,64}$/.test(scope)).slice(0, 30) : [];
+    console.warn("[Facebook OAuth] Read permission missing", {
+      type: ["USER", "SYSTEM_USER"].includes(data.type) ? data.type : "unknown",
+      scopes: safeScopes(scopes),
+      granularScopes: safeScopes(granularScopes),
+    });
+    throw new FacebookPermissionError();
+  }
   if (!["USER", "SYSTEM_USER"].includes(data.type)) throw new Error("Use a Facebook user or business system-user token.");
   const times = [data.expires_at, data.data_access_expires_at];
   if (typeof data.expires_at !== "number" || times.some(time => time !== undefined && (typeof time !== "number" || !Number.isFinite(time) || time < 0))) throw new Error("Facebook did not provide a valid token expiration.");

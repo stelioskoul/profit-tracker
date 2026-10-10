@@ -4,6 +4,11 @@ import type { TrpcContext } from "./_core/context";
 const mocks = vi.hoisted(() => ({
   getStoreById: vi.fn(),
   getShopifyConnectionByStoreId: vi.fn(),
+  getStripeConnectionByStoreId: vi.fn(),
+  upsertStripeConnection: vi.fn(),
+  deleteStripeConnection: vi.fn(),
+  verifyStripeConnection: vi.fn(),
+  fetchStripeLedger: vi.fn(),
   getFacebookConnectionsByStoreId: vi.fn(),
   getFacebookConnectionsForUser: vi.fn(),
   getCogsConfigByStoreId: vi.fn(),
@@ -20,6 +25,9 @@ vi.mock("./db", async importOriginal => ({
   ...(await importOriginal<typeof import("./db")>()),
   getStoreById: mocks.getStoreById,
   getShopifyConnectionByStoreId: mocks.getShopifyConnectionByStoreId,
+  getStripeConnectionByStoreId: mocks.getStripeConnectionByStoreId,
+  upsertStripeConnection: mocks.upsertStripeConnection,
+  deleteStripeConnection: mocks.deleteStripeConnection,
   getFacebookConnectionsByStoreId: mocks.getFacebookConnectionsByStoreId,
   getFacebookConnectionsForUser: mocks.getFacebookConnectionsForUser,
   getCogsConfigByStoreId: mocks.getCogsConfigByStoreId,
@@ -38,6 +46,7 @@ vi.mock("./exchange-rate", async importOriginal => ({
   getEurUsdRate: mocks.getEurUsdRate,
 }));
 vi.mock("./facebook-data", () => ({ fetchFacebookAdSpend: mocks.fetchFacebookAdSpend }));
+vi.mock('./stripe-data', () => ({ fetchStripeLedger: mocks.fetchStripeLedger, verifyStripeConnection: mocks.verifyStripeConnection }));
 
 import { appRouter } from "./routers";
 const context = (): TrpcContext => ({
@@ -54,6 +63,7 @@ beforeEach(() => {
     shopDomain: "store.myshopify.com", accessToken: "mock", apiVersion: "2026-07", scopes: "read_orders,read_shopify_payments_payouts,read_shopify_payments_disputes",
   });
   mocks.getFacebookConnectionsByStoreId.mockResolvedValue([]);
+  mocks.getStripeConnectionByStoreId.mockResolvedValue(undefined);
   mocks.getFacebookConnectionsForUser.mockResolvedValue([]);
   mocks.fetchFacebookAdSpend.mockResolvedValue({ spend: 10, currency: "EUR" });
   mocks.getCogsConfigByStoreId.mockResolvedValue([{ variantId: "1", cogsValue: "20", currency: "USD" }]);
@@ -83,6 +93,46 @@ beforeEach(() => {
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it('denies another owner access to Stripe credentials and connection changes before any provider or credential read', async () => {
+    mocks.getStoreById.mockResolvedValue({ id: 42, userId: 2 });
+    const caller = appRouter.createCaller(context());
+    await expect(caller.stripe.getConnection({ storeId: 42 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(caller.stripe.connect({ storeId: 42, apiKey: 'rk_live_mock' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(caller.stripe.disconnect({ storeId: 42 })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(mocks.getStripeConnectionByStoreId).not.toHaveBeenCalled();
+    expect(mocks.verifyStripeConnection).not.toHaveBeenCalled();
+    expect(mocks.upsertStripeConnection).not.toHaveBeenCalled();
+    expect(mocks.deleteStripeConnection).not.toHaveBeenCalled();
+  });
+
+  it('returns connection metadata without the private Stripe key', async () => {
+    mocks.getStripeConnectionByStoreId.mockResolvedValue({ accountId: 'acct_mock', accountName: 'Store', shopDomain: 'store.myshopify.com', connectedAt: new Date(), apiKey: 'rk_live_private' });
+    const result = await appRouter.createCaller(context()).stripe.getConnection({ storeId: 42 });
+    expect(result?.accountId).toBe('acct_mock');
+    expect(result).not.toHaveProperty('apiKey');
+  });
+
+  it('includes the separate Stripe ledger once, without adding charge principal as another sale', async () => {
+    mocks.getStripeConnectionByStoreId.mockResolvedValue({ apiKey: 'mock', shopDomain: 'store.myshopify.com' });
+    mocks.fetchStripeLedger.mockResolvedValue({ byCurrency: {}, pageCount: 2, fxApproximate: false, unclassifiedTypes: [], unclassifiedCount: 0,
+      reporting: { processingFees: 4, refunds: 5, disputeDebits: 100, disputeFees: 20, disputeRecoveries: 40, disputeFeeRecoveries: 0 } });
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.revenue).toBe(100);
+    expect(result.processingFees).toBe(7);
+    expect(result.disputeValue).toBe(200);
+    expect(result.disputeRecovered).toBe(140);
+    expect(result.disputeFeesRecovered).toBe(15); // No fee refund invented for Stripe's partial win.
+    expect(result.netProfit).toBe(-37);
+    expect(result.stripeLedgerPages).toBe(2);
+  });
+
+  it('does not certify detected unconnected PayPal fees as verified payments', async () => {
+    const orders = await mocks.fetchShopifyOrders();
+    mocks.fetchShopifyOrders.mockResolvedValue([{ ...orders[0], payment_gateway_names: ['paypal'] }]);
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.dataQuality.paymentsVerified).toBe(false);
+  });
+
   it("uses captured partial-payment revenue, flags real outside gateways/taxes and includes end-date expenses", async () => {
     const orders = await mocks.fetchShopifyOrders();
     mocks.fetchShopifyOrders.mockResolvedValue([{ ...orders[0], financial_status: 'partially_paid', captured_gross: 40, total_tax: '2.50', payment_gateway_names: ['paypal'] }]);

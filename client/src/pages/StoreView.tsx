@@ -285,7 +285,7 @@ export default function StoreView() {
               <>
                 <p className="text-sm text-muted-foreground">
                   Sales and product costs follow the order creation date; payment fees, refunds,
-                  dispute debits and recoveries follow Shopify Payments' processed date.
+                  dispute debits and recoveries follow Shopify Payments' processed date or the separate Stripe ledger's creation date.
                   Case outcomes below show their current status for disputes initiated in this range.
                   Order contribution excludes refunds, disputes, ad spend and operational expenses.
                 </p>
@@ -378,7 +378,7 @@ export default function StoreView() {
                     <CardContent className="p-4 space-y-2">
                       <h3 className="font-semibold text-sm text-amber-500 mb-3">Transaction Fees</h3>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground text-sm">Posted Shopify Payments fees</span>
+                        <span className="text-muted-foreground text-sm">Posted payment-provider fees</span>
                         <div className="text-right">
                           <div className="font-semibold text-sm">{formatCurrencyUSD(metrics.processingFees)}</div>
                           <div className="text-xs text-muted-foreground">{formatCurrencyEUR(metrics.processingFees / exchangeRate)}</div>
@@ -538,7 +538,22 @@ export default function StoreView() {
 
                 <Card className="glass">
                   <CardContent className="p-4 space-y-2">
-                    <h3 className="font-semibold text-sm text-amber-500">Dispute case outcomes</h3>
+                    {metrics.stripeConnected && <div className="space-y-2 pb-4">
+                      <h3 className="font-semibold text-sm">Separate Stripe postings in payout currencies</h3>
+                      <p className="text-xs text-muted-foreground">These amounts are included in profit once. Provider fees include standalone dispute-response fees and fee credits. Chargeback net loss = debits + dispute fees − recoveries − returned dispute fees.</p>
+                      <div className="overflow-x-auto"><table className="w-full text-xs text-right">
+                        <thead><tr><th className="p-2 text-left">Currency</th><th className="p-2">Provider fees</th><th className="p-2">Refunds</th><th className="p-2">Debits</th><th className="p-2">Dispute fees</th><th className="p-2">Recovered</th><th className="p-2">Fees returned</th><th className="p-2">Chargeback net loss</th></tr></thead>
+                        <tbody>{Object.entries(metrics.stripeLedgerByCurrency).map(([currency, totals]) => {
+                          const money = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(value);
+                          return <tr key={currency} className="border-t border-border/50">
+                            <td className="p-2 text-left font-semibold">{currency}</td><td className="p-2">{money(totals.processingFees)}</td><td className="p-2">{money(totals.refunds)}</td>
+                            <td className="p-2">{money(totals.disputeDebits)}</td><td className="p-2">{money(totals.disputeFees)}</td><td className="p-2">{money(totals.disputeRecoveries)}</td>
+                            <td className="p-2">{money(totals.disputeFeeRecoveries)}</td><td className="p-2 font-semibold">{money(totals.disputeNetLoss)}</td>
+                          </tr>;
+                        })}</tbody>
+                      </table></div>
+                    </div>}
+                    <h3 className="font-semibold text-sm text-amber-500">Shopify dispute case outcomes</h3>
                     <p className="text-xs text-muted-foreground">
                       Current status of cases initiated in this range — won: {metrics.disputeCases.won},
                       lost: {metrics.disputeCases.lost}, accepted: {metrics.disputeCases.accepted},

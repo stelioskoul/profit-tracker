@@ -96,6 +96,18 @@ export const shopifyConnections = pgTable("shopify_connections", {
 export type ShopifyConnection = typeof shopifyConnections.$inferSelect;
 export type InsertShopifyConnection = typeof shopifyConnections.$inferInsert;
 
+/** Separate Stripe gateway; one account can contribute to only one profile. */
+export const stripeConnections = pgTable('stripe_connections', {
+  id: serial('id').primaryKey(),
+  storeId: integer('storeId').notNull().unique().references(() => stores.id, { onDelete: 'cascade' }),
+  accountId: varchar('accountId', { length: 255 }).notNull().unique(),
+  accountName: varchar('accountName', { length: 255 }).notNull(),
+  shopDomain: varchar('shopDomain', { length: 255 }).notNull(),
+  apiKey: text('apiKey').notNull(),
+  connectedAt: timestamp('connectedAt', { withTimezone: true }).defaultNow().notNull(),
+});
+export type InsertStripeConnection = typeof stripeConnections.$inferInsert;
+
 /**
  * Facebook Ad Account connections.
  */

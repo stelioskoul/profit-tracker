@@ -285,7 +285,7 @@ export default function StoreView() {
               <>
                 <p className="text-sm text-muted-foreground">
                   Sales and product costs follow the order creation date; payment fees, refunds,
-                  dispute debits and recoveries follow Shopify Payments' processed date or the separate Stripe ledger's creation date.
+                  dispute debits and recoveries follow Shopify Payments' processed date, the separate Stripe ledger's creation date, or PayPal's reported transaction update date.
                   Case outcomes below show their current status for disputes initiated in this range.
                   Order contribution excludes refunds, disputes, ad spend and operational expenses.
                 </p>
@@ -544,6 +544,21 @@ export default function StoreView() {
                       <div className="overflow-x-auto"><table className="w-full text-xs text-right">
                         <thead><tr><th className="p-2 text-left">Currency</th><th className="p-2">Provider fees</th><th className="p-2">Refunds</th><th className="p-2">Debits</th><th className="p-2">Dispute fees</th><th className="p-2">Recovered</th><th className="p-2">Fees returned</th><th className="p-2">Chargeback net loss</th></tr></thead>
                         <tbody>{Object.entries(metrics.stripeLedgerByCurrency).map(([currency, totals]) => {
+                          const money = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(value);
+                          return <tr key={currency} className="border-t border-border/50">
+                            <td className="p-2 text-left font-semibold">{currency}</td><td className="p-2">{money(totals.processingFees)}</td><td className="p-2">{money(totals.refunds)}</td>
+                            <td className="p-2">{money(totals.disputeDebits)}</td><td className="p-2">{money(totals.disputeFees)}</td><td className="p-2">{money(totals.disputeRecoveries)}</td>
+                            <td className="p-2">{money(totals.disputeFeeRecoveries)}</td><td className="p-2 font-semibold">{money(totals.disputeNetLoss)}</td>
+                          </tr>;
+                        })}</tbody>
+                      </table></div>
+                    </div>}
+                    {metrics.paypalConnected && <div className="space-y-2 pb-4">
+                      <h3 className="font-semibold text-sm">PayPal postings in original currencies</h3>
+                      <p className="text-xs text-muted-foreground">Included once in profit. Provider fees include actual payment-fee credits on reversals. Holds and releases are excluded. Fee credits with an original dispute fee in this period appear as fees returned; otherwise they reduce provider fees. Reports available through {metrics.paypalAvailableThrough}.</p>
+                      <div className="overflow-x-auto"><table className="w-full text-xs text-right">
+                        <thead><tr><th className="p-2 text-left">Currency</th><th className="p-2">Provider fees</th><th className="p-2">Refunds</th><th className="p-2">Debits</th><th className="p-2">Dispute fees</th><th className="p-2">Recovered</th><th className="p-2">Fees returned</th><th className="p-2">Dispute net loss</th></tr></thead>
+                        <tbody>{Object.entries(metrics.paypalLedgerByCurrency).map(([currency, totals]) => {
                           const money = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(value);
                           return <tr key={currency} className="border-t border-border/50">
                             <td className="p-2 text-left font-semibold">{currency}</td><td className="p-2">{money(totals.processingFees)}</td><td className="p-2">{money(totals.refunds)}</td>

@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   deleteStripeConnection: vi.fn(),
   verifyStripeConnection: vi.fn(),
   fetchStripeLedger: vi.fn(),
+  getPayPalConnectionByStoreId: vi.fn(), upsertPayPalConnection: vi.fn(), deletePayPalConnection: vi.fn(),
+  getPayPalReportingToken: vi.fn(), readPayPalPostings: vi.fn(), verifyPayPalConnection: vi.fn(), getUsdReportingRates: vi.fn(),
   getFacebookConnectionsByStoreId: vi.fn(),
   getFacebookConnectionsForUser: vi.fn(),
   getCogsConfigByStoreId: vi.fn(),
@@ -28,6 +30,9 @@ vi.mock("./db", async importOriginal => ({
   getStripeConnectionByStoreId: mocks.getStripeConnectionByStoreId,
   upsertStripeConnection: mocks.upsertStripeConnection,
   deleteStripeConnection: mocks.deleteStripeConnection,
+  getPayPalConnectionByStoreId: mocks.getPayPalConnectionByStoreId,
+  upsertPayPalConnection: mocks.upsertPayPalConnection,
+  deletePayPalConnection: mocks.deletePayPalConnection,
   getFacebookConnectionsByStoreId: mocks.getFacebookConnectionsByStoreId,
   getFacebookConnectionsForUser: mocks.getFacebookConnectionsForUser,
   getCogsConfigByStoreId: mocks.getCogsConfigByStoreId,
@@ -44,9 +49,11 @@ vi.mock("./shopify-data", async importOriginal => ({
 vi.mock("./exchange-rate", async importOriginal => ({
   ...(await importOriginal<typeof import("./exchange-rate")>()),
   getEurUsdRate: mocks.getEurUsdRate,
+  getUsdReportingRates: mocks.getUsdReportingRates,
 }));
 vi.mock("./facebook-data", () => ({ fetchFacebookAdSpend: mocks.fetchFacebookAdSpend }));
 vi.mock('./stripe-data', () => ({ fetchStripeLedger: mocks.fetchStripeLedger, verifyStripeConnection: mocks.verifyStripeConnection }));
+vi.mock('./paypal-data', async original => ({...await original<typeof import('./paypal-data')>(), getPayPalReportingToken: mocks.getPayPalReportingToken, readPayPalPostings: mocks.readPayPalPostings, verifyPayPalConnection: mocks.verifyPayPalConnection}));
 
 import { appRouter } from "./routers";
 const context = (): TrpcContext => ({
@@ -64,6 +71,9 @@ beforeEach(() => {
   });
   mocks.getFacebookConnectionsByStoreId.mockResolvedValue([]);
   mocks.getStripeConnectionByStoreId.mockResolvedValue(undefined);
+  mocks.getPayPalConnectionByStoreId.mockResolvedValue(undefined);
+  mocks.getPayPalReportingToken.mockResolvedValue('read-only-token');
+  mocks.getUsdReportingRates.mockResolvedValue({USD:1,EUR:1.2});
   mocks.getFacebookConnectionsForUser.mockResolvedValue([]);
   mocks.fetchFacebookAdSpend.mockResolvedValue({ spend: 10, currency: "EUR" });
   mocks.getCogsConfigByStoreId.mockResolvedValue([{ variantId: "1", cogsValue: "20", currency: "USD" }]);
@@ -88,11 +98,38 @@ beforeEach(() => {
     totalDisputeValue: 100, totalDisputeFees: 15,
     totalDisputeRecovered: 100, totalDisputeFeesRecovered: 15,
     totalRefunds: 20, refundFeeAdjustments: 0,
-    pageCount: 1, fxApproximate: false, unclassifiedTypes: [], holdMovement: 0,
+    pageCount: 1, fxApproximate: false, unclassifiedTypes: [], unclassifiedCount: 0, unclassifiedSignedNet: 0, holdMovement: 0,
   });
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it('protects PayPal credentials and connection changes from another store owner', async () => {
+    mocks.getStoreById.mockResolvedValue({id:42,userId:2});
+    const caller=appRouter.createCaller(context());
+    await expect(caller.paypal.getConnection({storeId:42})).rejects.toMatchObject({code:'NOT_FOUND'});
+    await expect(caller.paypal.connect({storeId:42,clientId:'fixture-client-1234567890',clientSecret:'fixture-secret-1234567890',credentialsAcknowledged:true})).rejects.toMatchObject({code:'NOT_FOUND'});
+    await expect(caller.paypal.disconnect({storeId:42})).rejects.toMatchObject({code:'NOT_FOUND'});
+    expect(mocks.getPayPalConnectionByStoreId).not.toHaveBeenCalled();
+    expect(mocks.verifyPayPalConnection).not.toHaveBeenCalled();
+    expect(mocks.upsertPayPalConnection).not.toHaveBeenCalled();
+    expect(mocks.deletePayPalConnection).not.toHaveBeenCalled();
+  });
+  it('returns PayPal account metadata without either credential', async () => {
+    mocks.getPayPalConnectionByStoreId.mockResolvedValue({accountNumber:'merchant1',shopDomain:'store.myshopify.com',clientId:'private-id',clientSecret:'private-secret'});
+    const result=await appRouter.createCaller(context()).paypal.getConnection({storeId:42});
+    expect(result?.accountNumber).toBe('merchant1');
+    expect(result).not.toHaveProperty('clientId'); expect(result).not.toHaveProperty('clientSecret');
+  });
+  it('uses the complete requested PayPal period independently of an advertising transition and includes its costs only once', async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{adAccountId:'act_123',accessToken:'mock',spendToDate:'2026-08-31'}]);
+    mocks.getPayPalConnectionByStoreId.mockResolvedValue({accountNumber:'merchant1',shopDomain:'store.myshopify.com',clientId:'id',clientSecret:'secret'});
+    mocks.readPayPalPostings.mockResolvedValue({postings:[{transaction_id:'chargeback',transaction_event_code:'T1201',transaction_initiation_date:'2026-10-02T15:00:00Z',transaction_status:'S',transaction_amount:{currency_code:'USD',value:'-30'},fee_amount:{currency_code:'USD',value:'-2'}}],pageCount:1,availableThrough:'2026-10-03T00:00:00Z',incompleteRecentPeriod:false});
+    const result=await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(mocks.readPayPalPostings).toHaveBeenCalledWith('read-only-token',{fromDate:period.fromDate,toDate:period.toDate},-300,'America/New_York','merchant1');
+    expect(result.revenue).toBe(100); expect(result.adSpend).toBe(0);
+    expect(result.processingFees).toBe(5); expect(result.disputeValue).toBe(130);
+    expect(result.netProfit).toBe(20); expect(result.paypalConnected).toBe(true);
+  });
   it('clips an explicitly dated ad connection at its inclusive end date, with no changes to undated connections', async () => {
     mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: 'act_123', accessToken: 'mock', spendToDate: '2026-08-31' }]);
     mocks.getFacebookConnectionsForUser.mockResolvedValue([{ storeId: 43, storeName: 'New store', adAccountId: 'act_123', spendFromDate: '2026-09-01' }]);
@@ -134,7 +171,8 @@ describe("dashboard profit with payment-posting dates", () => {
     expect(result).not.toHaveProperty('apiKey');
   });
 
-  it('includes the separate Stripe ledger once, without adding charge principal as another sale', async () => {
+  it('includes the complete Stripe period independently of an advertising transition, without adding charge principal as another sale', async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: 'act_123', accessToken: 'mock', spendToDate: '2026-08-31' }]);
     mocks.getStripeConnectionByStoreId.mockResolvedValue({ apiKey: 'mock', shopDomain: 'store.myshopify.com' });
     mocks.fetchStripeLedger.mockResolvedValue({ byCurrency: {}, pageCount: 2, fxApproximate: false, unclassifiedTypes: [], unclassifiedCount: 0,
       reporting: { processingFees: 4, refunds: 5, disputeDebits: 100, disputeFees: 20, disputeRecoveries: 40, disputeFeeRecoveries: 0 } });
@@ -146,6 +184,8 @@ describe("dashboard profit with payment-posting dates", () => {
     expect(result.disputeFeesRecovered).toBe(15); // No fee refund invented for Stripe's partial win.
     expect(result.netProfit).toBe(-37);
     expect(result.stripeLedgerPages).toBe(2);
+    expect(result.adSpend).toBe(0);
+    expect(mocks.fetchStripeLedger).toHaveBeenCalledWith('mock', 'store.myshopify.com', { fromDate: period.fromDate, toDate: period.toDate }, 1.2, -300, 'America/New_York');
   });
 
   it('does not certify detected unconnected PayPal fees as verified payments', async () => {

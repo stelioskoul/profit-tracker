@@ -10,6 +10,8 @@ import {
   InsertShopifyConnection,
   stripeConnections,
   InsertStripeConnection,
+  paypalConnections,
+  InsertPayPalConnection,
   facebookConnections,
   InsertFacebookConnection,
   cogsConfig,
@@ -269,6 +271,33 @@ export async function deleteStripeConnection(storeId: number) {
   const db = await getDb();
   if (!db) throw new Error('Database not available');
   await db.delete(stripeConnections).where(eq(stripeConnections.storeId, storeId));
+}
+
+export async function getPayPalConnectionByStoreId(storeId: number) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  const [connection] = await db.select().from(paypalConnections).where(eq(paypalConnections.storeId, storeId)).limit(1);
+  return connection ? { ...connection, clientId: decryptToken(connection.clientId), clientSecret: decryptToken(connection.clientSecret) } : undefined;
+}
+
+export async function upsertPayPalConnection(connection: InsertPayPalConnection) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  const clientId = encryptToken(connection.clientId), clientSecret = encryptToken(connection.clientSecret);
+  try {
+    await db.insert(paypalConnections).values({ ...connection, clientId, clientSecret }).onConflictDoUpdate({
+      target: paypalConnections.storeId,
+      set: { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain, clientId, clientSecret, connectedAt: new Date() },
+    });
+  } catch {
+    throw new Error('Could not save PayPal. Its account may already be connected to another store profile.');
+  }
+}
+
+export async function deletePayPalConnection(storeId: number) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  await db.delete(paypalConnections).where(eq(paypalConnections.storeId, storeId));
 }
 
 // ============================================================================

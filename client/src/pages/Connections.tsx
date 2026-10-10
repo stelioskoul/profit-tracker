@@ -37,6 +37,18 @@ export default function Connections() {
   const { isAuthenticated, loading } = useAuth();
   const utils = trpc.useUtils();
   const [stripeKey, setStripeKey] = useState('');
+  const [paypalClientId, setPaypalClientId] = useState('');
+  const [paypalSecret, setPaypalSecret] = useState('');
+  const [paypalAcknowledged, setPaypalAcknowledged] = useState(false);
+  const { data: paypalConn, refetch: refetchPayPal } = trpc.paypal.getConnection.useQuery({ storeId }, { enabled: isAuthenticated && storeId > 0 });
+  const paypalConnect = trpc.paypal.connect.useMutation({
+    onSuccess: () => { setPaypalClientId(''); setPaypalSecret(''); setPaypalAcknowledged(false); refetchPayPal(); utils.metrics.getProfit.invalidate(); toast.success('PayPal reporting connected'); },
+    onError: error => toast.error(error.message),
+  });
+  const paypalDisconnect = trpc.paypal.disconnect.useMutation({
+    onSuccess: () => { refetchPayPal(); utils.metrics.getProfit.invalidate(); toast.success('PayPal disconnected'); },
+    onError: error => toast.error(error.message),
+  });
   const { data: stripeConn, refetch: refetchStripe } = trpc.stripe.getConnection.useQuery({ storeId }, { enabled: isAuthenticated && storeId > 0 });
   const stripeConnect = trpc.stripe.connect.useMutation({
     onSuccess: () => { setStripeKey(''); toast.success('Separate Stripe account connected'); refetchStripe(); utils.metrics.getProfit.invalidate(); },
@@ -203,6 +215,24 @@ export default function Connections() {
 
       <div className="container py-8 max-w-4xl">
         <div className="space-y-6">
+          <Card>
+            <CardHeader><CardTitle>PayPal reporting</CardTitle><CardDescription>Connect this store's dedicated live PayPal account for actual fees, refunds and dispute postings.</CardDescription></CardHeader>
+            <CardContent className="space-y-4">
+              {paypalConn ? <>
+                <p className="text-sm font-medium">PayPal account {paypalConn.accountNumber}</p>
+                <p className="text-sm text-muted-foreground">Connected only to {paypalConn.shopDomain}. All requested dates belong to this store. Profit Tracker obtains reporting-only tokens and reads transactions; it cannot issue payments using those tokens.</p>
+                <Button variant="destructive" disabled={paypalDisconnect.isPending} onClick={() => paypalDisconnect.mutate({ storeId })}>Disconnect PayPal</Button>
+              </> : <>
+                <p className="text-sm text-muted-foreground">Create a dedicated live app with Transaction Search enabled and other features disabled. Profit Tracker requests only transaction-reporting tokens. PayPal's client secret can still authorize broader APIs even with these settings; it is encrypted on the server to refresh reporting tokens automatically.</p>
+                <Label htmlFor="paypal-client-id">Live PayPal client ID</Label><Input id="paypal-client-id" type="password" autoComplete="off" value={paypalClientId} onChange={event => setPaypalClientId(event.target.value)} />
+                <Label htmlFor="paypal-secret">Live PayPal client secret</Label><Input id="paypal-secret" type="password" autoComplete="off" value={paypalSecret} onChange={event => setPaypalSecret(event.target.value)} />
+                <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={paypalAcknowledged} onChange={event => setPaypalAcknowledged(event.target.checked)} />This account's store payments belong only to this profile. I authorize encrypted storage of these credentials and understand the secret's broader access.</label>
+                <Button disabled={!shopifyConn || !paypalClientId.trim() || !paypalSecret.trim() || !paypalAcknowledged || paypalConnect.isPending} onClick={() => paypalConnect.mutate({ storeId, clientId: paypalClientId.trim(), clientSecret: paypalSecret.trim(), credentialsAcknowledged: true })}>
+                  {paypalConnect.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Connect PayPal reporting
+                </Button>
+              </>}
+            </CardContent>
+          </Card>
           <Card>
             <CardHeader>
               <CardTitle>Separate Stripe payments</CardTitle>

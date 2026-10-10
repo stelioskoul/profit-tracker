@@ -13,6 +13,7 @@ interface ExchangeRateResponse {
 
 let cachedRate: number | null = null;
 let cacheExpiry: number = 0;
+let cachedUsdRates: Record<string, number> | null = null;
 
 /**
  * Fetch live EUR/USD exchange rate
@@ -28,7 +29,7 @@ export async function getEurUsdRate(): Promise<number> {
 
   try {
     // Fetch from ExchangeRate-API (USD to EUR)
-    const response = await fetch("https://open.er-api.com/v6/latest/USD");
+    const response = await fetch("https://open.er-api.com/v6/latest/USD", { redirect: 'error', signal: AbortSignal.timeout(15000) });
     
     if (!response.ok) {
       throw new Error(`Exchange rate API returned ${response.status}`);
@@ -36,7 +37,8 @@ export async function getEurUsdRate(): Promise<number> {
 
     const data: ExchangeRateResponse = await response.json();
 
-    if (data.result !== "success" || !data.rates.EUR) {
+    if (data.result !== "success" || data.base_code !== 'USD' || !Number.isFinite(data.rates?.EUR) || data.rates.EUR <= 0 ||
+      data.rates.USD !== 1 || !Number.isFinite(data.time_next_update_unix) || data.time_next_update_unix * 1000 <= now) {
       throw new Error("Invalid exchange rate API response");
     }
 
@@ -46,6 +48,7 @@ export async function getEurUsdRate(): Promise<number> {
 
     // Cache for 24 hours
     cachedRate = eurToUsd;
+    cachedUsdRates = Object.fromEntries(Object.entries(data.rates).filter(([, value]) => Number.isFinite(value) && value > 0).map(([currency, value]) => [currency, 1 / value]));
     cacheExpiry = data.time_next_update_unix * 1000;
 
     console.log(`[Exchange Rate] Updated EUR/USD rate: ${eurToUsd.toFixed(4)} (valid until ${new Date(cacheExpiry).toISOString()})`);
@@ -54,12 +57,15 @@ export async function getEurUsdRate(): Promise<number> {
   } catch (error) {
     console.error("[Exchange Rate] Failed to fetch live rate:", error);
 
-    // Fall back to environment variable or default
-    const fallbackRate = parseFloat(process.env.EXCHANGE_RATE_EUR_USD || "1.08");
-    console.warn(`[Exchange Rate] Using fallback rate: ${fallbackRate}`);
-
-    return fallbackRate;
+    throw new Error('Reporting exchange rates could not be verified. Refresh again; profit was not calculated using a guessed rate.');
   }
+}
+
+/** Rates are USD per unit of each currency; these are current estimates. */
+export async function getUsdReportingRates(): Promise<Record<string, number>> {
+  await getEurUsdRate();
+  if (!cachedUsdRates) throw new Error('Reporting exchange rates are unavailable');
+  return { ...cachedUsdRates };
 }
 
 /**

@@ -17,8 +17,9 @@ import { calculateProfitBreakdown } from "./profit-formula";
 import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
 import { assertOrderHistoryAccess } from "./shopify-order-access";
 import { fetchStripeLedger, verifyStripeConnection } from './stripe-data';
+import { getPayPalReportingToken, readPayPalPostings, summarizePayPalPostings, verifyPayPalConnection } from './paypal-data';
 import { allocatedAdPeriod, adPeriodsOverlap } from './ad-spend-dates';
-import { getEurUsdRate, getCachedRate } from "./exchange-rate";
+import { getEurUsdRate, getCachedRate, getUsdReportingRates } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
 
 async function saveVerifiedFacebookConnection(storeId: number, accessToken: string, adAccountId: string) {
@@ -520,6 +521,32 @@ export const appRouter = router({
       return { success: true };
     }),
   }),
+  paypal: router({
+    getConnection: protectedProcedure.input(z.object({ storeId: z.number() })).query(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      const connection = await db.getPayPalConnectionByStoreId(input.storeId);
+      return connection ? { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain, connectedAt: connection.connectedAt } : null;
+    }),
+    connect: protectedProcedure.input(z.object({ storeId: z.number(), clientId: z.string().trim().regex(/^[A-Za-z0-9_-]{20,255}$/),
+      clientSecret: z.string().trim().regex(/^[A-Za-z0-9_-]{20,255}$/), credentialsAcknowledged: z.literal(true) })).mutation(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      const shopify = await db.getShopifyConnectionByStoreId(input.storeId);
+      if (!shopify) throw new TRPCError({ code: 'BAD_REQUEST', message: 'Connect Shopify before connecting its PayPal account' });
+      try {
+        const account = await verifyPayPalConnection(input.clientId, input.clientSecret);
+        await db.upsertPayPalConnection({ storeId: input.storeId, shopDomain: shopify.shopDomain, clientId: input.clientId, clientSecret: input.clientSecret, ...account });
+      } catch (error) { throw new TRPCError({ code: 'BAD_REQUEST', message: (error as Error).message }); }
+      return { success: true };
+    }),
+    disconnect: protectedProcedure.input(z.object({ storeId: z.number() })).mutation(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      await db.deletePayPalConnection(input.storeId);
+      return { success: true };
+    }),
+  }),
   facebook: router({
     getAuthUrl: protectedProcedure
       .input(z.object({ storeId: z.number() }))
@@ -735,6 +762,7 @@ export const appRouter = router({
         const shopifyConn = await db.getShopifyConnectionByStoreId(input.storeId);
         const facebookConns = await db.getFacebookConnectionsByStoreId(input.storeId);
         const stripeConn = await db.getStripeConnectionByStoreId(input.storeId);
+        const paypalConn = await db.getPayPalConnectionByStoreId(input.storeId);
         const rate = await getEurUsdRate();
         const warnings: string[] = [];
         let processed: ReturnType<typeof processOrders> = {
@@ -763,6 +791,9 @@ export const appRouter = router({
         let stripeLedgerByCurrency: Record<string, NativeBalanceTotals> = {};
         let stripeLedgerPages = 0;
         let stripeProcessingFees = 0;
+        let paypalLedgerByCurrency: Record<string, NativeBalanceTotals> = {};
+        let paypalLedgerPages = 0;
+        let paypalAvailableThrough: string | null = null;
         let outsideGatewaysMissing: string[] = [];
 
         if (shopifyConn) {
@@ -828,11 +859,35 @@ export const appRouter = router({
           if (ledger.holdMovement !== 0) {
             warnings.push("Shopify held/released funds are excluded from operating profit; they are not a finalized loss.");
           }
+          if (paypalConn) {
+            if (paypalConn.shopDomain !== shopifyConn.shopDomain) throw new Error('PayPal is connected to a different Shopify store');
+            const token = await getPayPalReportingToken(paypalConn.clientId, paypalConn.clientSecret);
+            const paypalLedger = await readPayPalPostings(token, period, offset, store.timezone, paypalConn.accountNumber);
+            const paypal = summarizePayPalPostings(paypalLedger.postings, await getUsdReportingRates());
+            paypalLedgerByCurrency = paypal.byCurrency;
+            paypalLedgerPages = paypalLedger.pageCount;
+            paypalAvailableThrough = paypalLedger.availableThrough;
+            processingFees += paypal.reporting.processingFees;
+            refunds += paypal.reporting.refunds;
+            disputeValue += paypal.reporting.disputeDebits;
+            disputeFees += paypal.reporting.disputeFees;
+            disputeRecovered += paypal.reporting.disputeRecoveries;
+            disputeFeesRecovered += paypal.reporting.disputeFeeRecoveries;
+            ledgerFxApproximate ||= paypal.fxApproximate;
+            fxApproximate ||= paypal.fxApproximate;
+            unclassifiedTypes.push(...paypal.unclassifiedTypes.map(type => `PayPal:${type}`));
+            unreconciledLedgerCount += paypal.unclassifiedCount;
+            unreconciledLedgerNet += paypal.reporting.unclassifiedNet;
+            warnings.push('PayPal reporting covers the dedicated account connected to this profile, with no store-transition date split. Events follow their reported update date and can change when PayPal revises records. Sales principal is not added again. Temporary holds, reserve releases, currency transfers and bank withdrawals are excluded from operating profit.');
+            if (paypal.outgoingPaymentCount) warnings.push(`${paypal.outgoingPaymentCount} outgoing PayPal purchases were excluded. Reconcile these against advertising, supplier costs and operating expenses before adding them, to avoid counting the same cost twice.`);
+            if (paypal.unmatchedFeeCredits) warnings.push(`${paypal.unmatchedFeeCredits} PayPal fee credits reduce provider fees because their original fee is outside this report. The period's dispute-fee-return subtotal therefore needs separate attribution.`);
+            if (paypalLedger.incompleteRecentPeriod) warnings.push(`PayPal reports are currently available through ${paypalAvailableThrough}; recent transactions may not have appeared yet.`);
+          }
           if (unclassifiedTypes.length) {
-            warnings.push(`${unreconciledLedgerCount} Shopify Payments ledger entries (signed net ${unreconciledLedgerNet.toFixed(2)} USD) were excluded because their operating-profit treatment is unknown: ${unclassifiedTypes.join(", ")}. Reconcile these postings before relying on profit.`);
+            warnings.push(`${unreconciledLedgerCount} provider ledger entries (signed net ${unreconciledLedgerNet.toFixed(2)} USD) were excluded because their operating-profit treatment is unresolved: ${unclassifiedTypes.join(", ")}. Reconcile these postings before relying on profit.`);
           }
           if (fxApproximate) {
-            warnings.push("EUR balance entries were converted to USD at today's rate; this is an estimate, not historical settlement FX.");
+            warnings.push("Foreign-currency provider postings were converted to USD at today's rates; this is an estimate, not historical settlement FX.");
           }
 
           const [cogsConfigs, shippingConfigs, feeConfig] = await Promise.all([
@@ -876,7 +931,7 @@ export const appRouter = router({
             ["paid", "partially_paid", "partially_refunded", "refunded"].includes(order.financial_status || ""));
           const outsideGateways = Array.from(new Set(sales.flatMap(order => order.payment_gateway_names ?? [])
             .filter(gateway => gateway !== "shopify_payments")));
-          outsideGatewaysMissing = outsideGateways.filter(gateway => !(stripeConn && gateway === 'Stripe Card Payments'));
+          outsideGatewaysMissing = outsideGateways.filter(gateway => !(stripeConn && gateway === 'Stripe Card Payments') && !(paypalConn && gateway.toLowerCase() === 'paypal'));
           if (outsideGatewaysMissing.length) warnings.push(`Orders in this range use unconnected outside gateways: ${outsideGatewaysMissing.join(", ")}. Their revenue is included, but their actual fees, refunds and disputes require a separate provider connection.`);
           const taxCollected = sales.reduce((sum, order) => sum + Number(order.total_tax ?? 0), 0);
           if (!Number.isFinite(taxCollected)) throw new Error("Shopify order has an invalid tax amount");
@@ -990,6 +1045,10 @@ export const appRouter = router({
           stripeLedgerPages,
           stripeProcessingFees,
           stripeConnected: !!stripeConn,
+          paypalLedgerByCurrency,
+          paypalLedgerPages,
+          paypalAvailableThrough,
+          paypalConnected: !!paypalConn,
           operationalExpenses,
           exchangeRateUsed: rate,
           totalCosts: breakdown.totalCosts,
@@ -1017,7 +1076,7 @@ export const appRouter = router({
             unreconciledLedgerNet,
             unreconciledLedgerCount,
             warnings,
-            basis: "Orders by created date; Shopify Payments postings by processed date; separate Stripe postings by created date",
+            basis: "Orders by created date; Shopify Payments postings by processed date; separate Stripe postings by created date; PayPal reporting events by transaction updated date",
           },
         };
       }),

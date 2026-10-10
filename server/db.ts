@@ -313,6 +313,7 @@ export async function getFacebookConnectionsForUser(userId: number) {
   if (!db) return [];
   return db.select({ id: facebookConnections.id, storeId: stores.id, storeName: stores.name,
     adAccountId: facebookConnections.adAccountId, adAccountName: facebookConnections.adAccountName,
+    spendFromDate: facebookConnections.spendFromDate, spendToDate: facebookConnections.spendToDate,
     tokenExpiresAt: facebookConnections.tokenExpiresAt, tokenType: facebookConnections.tokenType })
     .from(facebookConnections).innerJoin(stores, eq(facebookConnections.storeId, stores.id)).where(eq(stores.userId, userId));
 }
@@ -331,6 +332,12 @@ export async function deleteFacebookConnection(connectionId: number) {
   if (!db) throw new Error("Database not available");
 
   await db.delete(facebookConnections).where(eq(facebookConnections.id, connectionId));
+}
+
+export async function updateFacebookSpendDates(connectionId: number, spendFromDate: string | null, spendToDate: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  await db.update(facebookConnections).set({ spendFromDate, spendToDate }).where(eq(facebookConnections.id, connectionId));
 }
 
 // ============================================================================

@@ -93,6 +93,28 @@ beforeEach(() => {
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it('clips an explicitly dated ad connection at its inclusive end date, with no changes to undated connections', async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: 'act_123', accessToken: 'mock', spendToDate: '2026-08-31' }]);
+    mocks.getFacebookConnectionsForUser.mockResolvedValue([{ storeId: 43, storeName: 'New store', adAccountId: 'act_123', spendFromDate: '2026-09-01' }]);
+    const result = await appRouter.createCaller(context()).metrics.getProfit({ storeId: 42, fromDate: '2026-08-30', toDate: '2026-09-02' });
+    expect(mocks.fetchFacebookAdSpend).toHaveBeenCalledWith('act_123', 'mock', { fromDate: '2026-08-30', toDate: '2026-08-31' }, 'v25.0');
+    expect(result.adSpend).toBe(12);
+    expect(result.dataQuality.warnings.join(' ')).not.toContain('count ads twice');
+  });
+
+  it('uses zero advertising without fetching outside a connection’s date range', async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: 'act_123', accessToken: 'mock', spendToDate: '2026-08-31' }]);
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.adSpend).toBe(0);
+    expect(mocks.fetchFacebookAdSpend).not.toHaveBeenCalled();
+  });
+
+  it('keeps a future store’s undated connection on the complete requested period', async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: 'act_999', accessToken: 'mock' }]);
+    await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(mocks.fetchFacebookAdSpend).toHaveBeenCalledWith('act_999', 'mock', { fromDate: period.fromDate, toDate: period.toDate }, 'v25.0');
+  });
+
   it('denies another owner access to Stripe credentials and connection changes before any provider or credential read', async () => {
     mocks.getStoreById.mockResolvedValue({ id: 42, userId: 2 });
     const caller = appRouter.createCaller(context());

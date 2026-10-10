@@ -17,6 +17,7 @@ import { calculateProfitBreakdown } from "./profit-formula";
 import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
 import { assertOrderHistoryAccess } from "./shopify-order-access";
 import { fetchStripeLedger, verifyStripeConnection } from './stripe-data';
+import { allocatedAdPeriod, adPeriodsOverlap } from './ad-spend-dates';
 import { getEurUsdRate, getCachedRate } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
 
@@ -594,7 +595,25 @@ export const appRouter = router({
           connectedAt: conn.connectedAt,
           lastSyncAt: conn.lastSyncAt,
           tokenExpiresAt: conn.tokenExpiresAt,
+          spendFromDate: conn.spendFromDate,
+          spendToDate: conn.spendToDate,
         }));
+      }),
+
+    setSpendDates: protectedProcedure
+      .input(z.object({ connectionId: z.number(), spendFromDate: z.string().nullable(), spendToDate: z.string().nullable() }))
+      .mutation(async ({ ctx, input }) => {
+        const connection = await db.getFacebookConnectionById(input.connectionId);
+        const store = connection && await db.getStoreById(connection.storeId);
+        if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+        const from = input.spendFromDate || null, to = input.spendToDate || null;
+        try {
+          if (from || to) validateDateRange({ fromDate: from || to!, toDate: to || from! });
+        } catch (error) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: (error as Error).message });
+        }
+        await db.updateFacebookSpendDates(input.connectionId, from, to);
+        return { success: true };
       }),
 
     disconnect: protectedProcedure
@@ -903,12 +922,15 @@ export const appRouter = router({
           const accountId = connection.adAccountId.replace(/^act_/, "");
           if (chargedAdAccounts.has(accountId)) continue;
           chargedAdAccounts.add(accountId);
+          const adPeriod = allocatedAdPeriod({ fromDate: input.fromDate, toDate: input.toDate }, connection);
+          if (connection.spendFromDate || connection.spendToDate) warnings.push(`Meta ad-account ${accountId} spend is allocated to this profile ${connection.spendFromDate ? `from ${connection.spendFromDate}` : 'from all earlier dates'} ${connection.spendToDate ? `through ${connection.spendToDate}` : 'onward'}.`);
+          if (!adPeriod) continue;
           const otherStores = ownedAdConnections.filter(other => other.storeId !== input.storeId &&
-            other.adAccountId.replace(/^act_/, "") === accountId).map(other => other.storeName);
-          if (otherStores.length) warnings.push(`The full Meta ad-account spend is also connected to ${Array.from(new Set(otherStores)).join(", ")}. Each profile deducts the full spend; adding their profits together would count ads twice. A store allocation is required for a combined profit.`);
+            other.adAccountId.replace(/^act_/, "") === accountId && adPeriodsOverlap(adPeriod, allocatedAdPeriod({ fromDate: input.fromDate, toDate: input.toDate }, other))).map(other => other.storeName);
+          if (otherStores.length) warnings.push(`Meta ad-account spend overlaps with ${Array.from(new Set(otherStores)).join(", ")}. Adding these profiles' profits can count ads twice. Set non-overlapping advertising dates or reconcile another allocation.`);
           const result = await fetchFacebookAdSpend(
             connection.adAccountId, connection.accessToken,
-            { fromDate: input.fromDate, toDate: input.toDate },
+            adPeriod,
             connection.apiVersion || "v25.0");
           if (result.currency === "USD") adSpend += result.spend;
           else if (result.currency === "EUR") {

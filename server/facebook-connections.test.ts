@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TrpcContext } from "./_core/context";
-const mocks = vi.hoisted(() => ({getStoreById:vi.fn(),getFacebookConnectionById:vi.fn(),upsertFacebookConnection:vi.fn(),prepareFacebookToken:vi.fn(),verifyFacebookAdAccount:vi.fn()}));
-vi.mock("./db",async original=>({...await original<typeof import("./db")>(),getStoreById:mocks.getStoreById,getFacebookConnectionById:mocks.getFacebookConnectionById,upsertFacebookConnection:mocks.upsertFacebookConnection}));
+const mocks = vi.hoisted(() => ({getStoreById:vi.fn(),getFacebookConnectionById:vi.fn(),upsertFacebookConnection:vi.fn(),updateFacebookSpendDates:vi.fn(),prepareFacebookToken:vi.fn(),verifyFacebookAdAccount:vi.fn()}));
+vi.mock("./db",async original=>({...await original<typeof import("./db")>(),getStoreById:mocks.getStoreById,getFacebookConnectionById:mocks.getFacebookConnectionById,upsertFacebookConnection:mocks.upsertFacebookConnection,updateFacebookSpendDates:mocks.updateFacebookSpendDates}));
 vi.mock("./facebook-oauth",async original=>({...await original<typeof import("./facebook-oauth")>(),prepareFacebookToken:mocks.prepareFacebookToken,verifyFacebookAdAccount:mocks.verifyFacebookAdAccount}));
 import {appRouter} from "./routers";
 const ctx = {user:{id:20,role:"user"},req:{headers:{}},res:{}} as TrpcContext;
@@ -12,15 +12,30 @@ beforeEach(()=>{
   mocks.verifyFacebookAdAccount.mockResolvedValue({id:"act_123",name:"Minicubez",currency:"EUR",timezone_offset_hours_utc:3});
 });
 describe("Facebook connection isolation and actual expiry",()=>{
+  it('saves date bounds only for an owned connection and rejects invalid dates', async () => {
+    const caller = appRouter.createCaller(ctx);
+    await expect(caller.facebook.setSpendDates({connectionId:1,spendFromDate:'2026-09-01',spendToDate:'2026-08-31'})).rejects.toMatchObject({code:'BAD_REQUEST'});
+    expect(mocks.updateFacebookSpendDates).not.toHaveBeenCalled();
+    await caller.facebook.setSpendDates({connectionId:1,spendFromDate:'2026-09-01',spendToDate:null});
+    expect(mocks.updateFacebookSpendDates).toHaveBeenCalledWith(1,'2026-09-01',null);
+    vi.clearAllMocks();
+    mocks.getStoreById.mockResolvedValue({id:14,userId:30});
+    await expect(caller.facebook.setSpendDates({connectionId:1,spendFromDate:null,spendToDate:null})).rejects.toMatchObject({code:'NOT_FOUND'});
+    expect(mocks.updateFacebookSpendDates).not.toHaveBeenCalled();
+  });
   it("only shares an account between profiles owned by the authenticated user",async()=>{
     mocks.getStoreById.mockImplementation(async id=>({id,userId:id===14?30:20}));
     await expect(appRouter.createCaller(ctx).facebook.connectExisting({storeId:10,connectionId:1})).rejects.toMatchObject({code:"NOT_FOUND"});
     expect(mocks.prepareFacebookToken).not.toHaveBeenCalled(); expect(mocks.upsertFacebookConnection).not.toHaveBeenCalled();
   });
   it("verifies access and stores the selected account's real metadata and no-expiry verdict",async()=>{
+    mocks.getFacebookConnectionById.mockResolvedValue({id:1,storeId:14,adAccountId:"act_123",accessToken:"private-token",spendFromDate:"2026-09-01",spendToDate:null});
     expect(await appRouter.createCaller(ctx).facebook.connectExisting({storeId:10,connectionId:1})).toEqual({success:true});
     expect(mocks.verifyFacebookAdAccount).toHaveBeenCalledWith("verified-token","act_123");
     expect(mocks.upsertFacebookConnection).toHaveBeenCalledWith(expect.objectContaining({storeId:10,adAccountId:"act_123",adAccountName:"Minicubez",tokenExpiresAt:null,tokenType:"SYSTEM_USER",timezoneOffset:180}));
+    const saved = mocks.upsertFacebookConnection.mock.calls[0][0];
+    expect(saved).not.toHaveProperty('spendFromDate');
+    expect(saved).not.toHaveProperty('spendToDate');
   });
   it("does not invent a one-year expiry for manual tokens",async()=>{
     const expiresAt = new Date("2030-01-01T00:00:00Z"); mocks.prepareFacebookToken.mockResolvedValue({accessToken:"verified-token",type:"USER",expiresAt});

@@ -11,6 +11,25 @@ import { useEffect, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { toast } from "sonner";
 
+function AdvertisingDates({ connectionId, from, to, onSaved }: { connectionId: number; from: string | null; to: string | null; onSaved: () => void }) {
+  const [start, setStart] = useState(from || '');
+  const [end, setEnd] = useState(to || '');
+  useEffect(() => { setStart(from || ''); setEnd(to || ''); }, [from, to]);
+  const save = trpc.facebook.setSpendDates.useMutation({
+    onSuccess: () => { toast.success('Advertising dates saved'); onSaved(); },
+    onError: error => toast.error(error.message),
+  });
+  return <div className="space-y-2 border-t pt-3 mt-3">
+    <p className="text-sm font-medium">Advertising dates for this store</p>
+    <p className="text-xs text-muted-foreground">Include this account's spend only within these dates. Leave either field blank for an open range; leave both blank to use all dates.</p>
+    <div className="grid grid-cols-2 gap-3">
+      <div><Label htmlFor={`ad-from-${connectionId}`}>Include spend from</Label><Input id={`ad-from-${connectionId}`} type="date" value={start} onChange={e => setStart(e.target.value)} /></div>
+      <div><Label htmlFor={`ad-to-${connectionId}`}>Include spend through</Label><Input id={`ad-to-${connectionId}`} type="date" value={end} onChange={e => setEnd(e.target.value)} /></div>
+    </div>
+    <Button size="sm" variant="outline" disabled={save.isPending} onClick={() => save.mutate({ connectionId, spendFromDate: start || null, spendToDate: end || null })}>Save advertising dates</Button>
+  </div>;
+}
+
 export default function Connections() {
   const { id } = useParams();
   const storeId = parseInt(id || "0");
@@ -353,12 +372,12 @@ export default function Connections() {
                   </Button>
                 </div>
               )}
-              <p className="text-xs text-muted-foreground mb-4">Ad spend uses the entire ad account for the selected dates. If you connect the same account to multiple stores, each includes that account's spend.</p>
+              <p className="text-xs text-muted-foreground mb-4">Ad spend uses this account's full spend within the dashboard dates and this store's optional advertising dates. Shared accounts with overlapping dates can count spend twice across stores.</p>
               {facebookConns && facebookConns.length > 0 ? (
                 <div className="space-y-4">
                   {facebookConns.map((conn) => (
-                    <div key={conn.id} className="flex items-center justify-between border rounded-lg p-4">
-                      <div>
+                    <div key={conn.id} className="border rounded-lg p-4">
+                      <div className="flex items-center justify-between"><div>
                         <p className="text-sm font-medium">{conn.adAccountName || "Facebook ad account"}</p>
                         <p className="text-xs text-muted-foreground">Account: {conn.adAccountId}</p>
                         <p className="text-xs text-muted-foreground">
@@ -377,6 +396,8 @@ export default function Connections() {
                         {facebookDisconnectMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                         Disconnect
                       </Button>
+                      </div>
+                      <AdvertisingDates connectionId={conn.id} from={conn.spendFromDate} to={conn.spendToDate} onSaved={refreshFacebook} />
                     </div>
                   ))}
                   <Button variant="outline" onClick={handleFacebookConnect} disabled={facebookAuthMutation.isPending}>

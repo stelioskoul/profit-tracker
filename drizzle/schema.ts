@@ -125,6 +125,8 @@ export const facebookConnections = pgTable(
     tokenExpiresAt: timestamp("tokenExpiresAt", { withTimezone: true }),
     apiVersion: varchar("apiVersion", { length: 20 }).default("v25.0"),
     timezoneOffset: integer("timezoneOffset").default(-300),
+    spendFromDate: varchar("spendFromDate", { length: 10 }),
+    spendToDate: varchar("spendToDate", { length: 10 }),
     connectedAt: timestamp("connectedAt", { withTimezone: true })
       .defaultNow()
       .notNull(),

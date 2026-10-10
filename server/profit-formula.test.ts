@@ -9,6 +9,11 @@ const baseline = {
 };
 
 describe("operating-profit reconciliation", () => {
+  it("books a protection credit and its reversal once without creating sales or guessing returned fees", () => {
+    const base = calculateProfitBreakdown(baseline);
+    expect(calculateProfitBreakdown({ ...baseline, disputeProtectionNet: 115 }).netProfit).toBe(base.netProfit + 115);
+    expect(calculateProfitBreakdown({ ...baseline, disputeProtectionNet: -115 }).netProfit).toBe(base.netProfit - 115);
+  });
   it("subtracts posted principal debits and actual fees, and credits posted recoveries once", () => {
     const result = calculateProfitBreakdown(baseline);
     expect(result).toMatchObject({ totalCosts: 127, netProfit: 73, margin: 36.5 });

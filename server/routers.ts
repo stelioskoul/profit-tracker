@@ -10,7 +10,7 @@ import { configuredShopifyStoresForUser, getConfiguredShopifyToken } from "./sho
 import { getFacebookAuthUrl, prepareFacebookToken, getFacebookAdAccounts, verifyFacebookAdAccount, FACEBOOK_API_VERSION } from "./facebook-oauth";
 import { readPendingFacebookToken, clearPendingFacebookToken } from "./facebook-pending";
 import { createOAuthState } from "./oauth-state";
-import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions, type DisputeSummary } from "./shopify-data";
+import { fetchShopifyOrders, fetchShopifyDisputes, fetchShopifyBalanceTransactions, type DisputeSummary, type NativeBalanceTotals } from "./shopify-data";
 import { fetchFacebookAdSpend } from "./facebook-data";
 import { processOrders, calculateOperationalExpensesForPeriod } from "./profit-calculator";
 import { calculateProfitBreakdown } from "./profit-formula";
@@ -701,6 +701,7 @@ export const appRouter = router({
         let disputeFees = 0;
         let disputeRecovered = 0;
         let disputeFeesRecovered = 0;
+        let disputeProtectionNet = 0;
         let refunds = 0;
         let ledgerPages = 0;
         let unclassifiedTypes: string[] = [];
@@ -708,6 +709,8 @@ export const appRouter = router({
         let unreconciledLedgerCount = 0;
         let fxApproximate = false;
         let perOrderFeeEstimates = 0;
+        let ledgerByCurrency: Record<string, NativeBalanceTotals> = {};
+        let ledgerFxApproximate = false;
 
         if (shopifyConn) {
           if (store.currency !== "USD") {
@@ -734,12 +737,15 @@ export const appRouter = router({
           disputeFees = ledger.totalDisputeFees;
           disputeRecovered = ledger.totalDisputeRecovered;
           disputeFeesRecovered = ledger.totalDisputeFeesRecovered;
+          disputeProtectionNet = ledger.disputeProtectionNet ?? 0;
           refunds = ledger.totalRefunds;
           ledgerPages = ledger.pageCount;
           unclassifiedTypes = ledger.unclassifiedTypes;
           unreconciledLedgerNet = ledger.unclassifiedSignedNet;
           unreconciledLedgerCount = ledger.unclassifiedCount;
           fxApproximate = ledger.fxApproximate;
+          ledgerFxApproximate = ledger.fxApproximate;
+          ledgerByCurrency = ledger.byCurrency ?? {};
           warnings.push("The Shopify Payments ledger does not contain fees, refunds or disputes from PayPal or other outside payment gateways. Reconcile those separately if used.");
           // Charge fees and refund fee adjustments are recognized on their
           // balance-transaction processed_at date, including for old orders.
@@ -789,6 +795,17 @@ export const appRouter = router({
           }
           processed = processOrders(
             orders, cogsMap, shippingMap, rate, ledger.orderFees, percentFee, fixedFee);
+          const partiallyPaid = orders.filter(order => !order.test && order.financial_status === "partially_paid").length;
+          if (partiallyPaid) warnings.push(`${partiallyPaid} partially paid orders include only successful captured payments in revenue. Configured product and shipping costs assume full fulfillment; reconcile their actual fulfillment costs.`);
+          const sales = orders.filter(order => !order.test &&
+            ["paid", "partially_paid", "partially_refunded", "refunded"].includes(order.financial_status || ""));
+          const outsideGateways = Array.from(new Set(sales.flatMap(order => order.payment_gateway_names ?? [])
+            .filter(gateway => gateway !== "shopify_payments")));
+          if (outsideGateways.length) warnings.push(`Orders in this range use outside gateways: ${outsideGateways.join(", ")}. Their revenue is included, but their actual fees, refunds and disputes require a separate provider connection.`);
+          const taxCollected = sales.reduce((sum, order) => sum + Number(order.total_tax ?? 0), 0);
+          if (!Number.isFinite(taxCollected)) throw new Error("Shopify order has an invalid tax amount");
+          if (taxCollected > 0) warnings.push(`Shopify reports ${taxCollected.toFixed(2)} USD sales tax on orders in this range. Gross revenue, tax liabilities and refunded taxes are not reconciled as accounting income or expense.`);
+          if (sales.some(order => order.line_items.some(item => item.gift_card))) warnings.push("Gift-card sales are included in gross order revenue. Deferred gift-card liabilities and redemptions require reconciliation before treating this as accounting revenue.");
           let missingCogs = 0;
           let missingShipping = 0;
           for (const order of processed.processedOrders) {
@@ -823,16 +840,31 @@ export const appRouter = router({
         }
 
         let adSpend = 0;
+        const ownedAdConnections = facebookConns.length ? await db.getFacebookConnectionsForUser(ctx.user.id) : [];
+        const chargedAdAccounts = new Set<string>();
         for (const connection of facebookConns) {
+          const accountId = connection.adAccountId.replace(/^act_/, "");
+          if (chargedAdAccounts.has(accountId)) continue;
+          chargedAdAccounts.add(accountId);
+          const otherStores = ownedAdConnections.filter(other => other.storeId !== input.storeId &&
+            other.adAccountId.replace(/^act_/, "") === accountId).map(other => other.storeName);
+          if (otherStores.length) warnings.push(`The full Meta ad-account spend is also connected to ${Array.from(new Set(otherStores)).join(", ")}. Each profile deducts the full spend; adding their profits together would count ads twice. A store allocation is required for a combined profit.`);
           const result = await fetchFacebookAdSpend(
             connection.adAccountId, connection.accessToken,
             { fromDate: input.fromDate, toDate: input.toDate },
             connection.apiVersion || "v25.0");
           if (result.currency === "USD") adSpend += result.spend;
-          else if (result.currency === "EUR") adSpend += result.spend * rate;
+          else if (result.currency === "EUR") {
+            adSpend += result.spend * rate;
+            fxApproximate = true;
+            if (!warnings.some(message => message.includes("Meta spend"))) {
+              warnings.push("EUR Meta spend uses today's EUR/USD rate, not historical billed exchange rates. Meta daily reporting follows the ad account's timezone.");
+            }
+          }
           else throw new Error(`Unsupported ad-account currency: ${result.currency}`);
         }
         const expenses = await db.getOperationalExpensesByStoreId(input.storeId);
+        if (!expenses.length) warnings.push("No operational expenses are configured. Enter Shopify subscriptions, app fees and other business expenses separately.");
         const operationalExpenses = calculateOperationalExpensesForPeriod(
           expenses.map(expense => ({
             type: expense.type,
@@ -842,7 +874,7 @@ export const appRouter = router({
             endDate: expense.endDate,
           })),
           new Date(`${input.fromDate}T00:00:00Z`),
-          new Date(`${input.toDate}T00:00:00Z`));
+          new Date(`${input.toDate}T23:59:59.999Z`));
         const breakdown = calculateProfitBreakdown({
           revenue: processed.revenue,
           cogs: processed.totalCogs,
@@ -855,6 +887,7 @@ export const appRouter = router({
           disputeFees,
           disputeRecovered,
           disputeFeesRecovered,
+          disputeProtectionNet,
         });
         const orderProfits = processed.processedOrders.map(order => order.profit);
         const orderMargins = processed.processedOrders.map(
@@ -871,7 +904,9 @@ export const appRouter = router({
           disputeFees,
           disputeRecovered,
           disputeFeesRecovered,
+          disputeProtectionNet,
           refunds,
+          ledgerByCurrency,
           operationalExpenses,
           exchangeRateUsed: rate,
           totalCosts: breakdown.totalCosts,
@@ -891,7 +926,7 @@ export const appRouter = router({
           },
           dataQuality: {
             shopifyConnected: !!shopifyConn,
-            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !fxApproximate && !perOrderFeeEstimates,
+            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !ledgerFxApproximate,
             ledgerPages,
             fxApproximate,
             perOrderFeeEstimates,

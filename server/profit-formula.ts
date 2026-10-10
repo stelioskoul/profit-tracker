@@ -17,6 +17,7 @@ export interface ProfitComponents {
   disputeFees: number;
   disputeRecovered: number;
   disputeFeesRecovered: number;
+  disputeProtectionNet?: number;
 }
 
 export function calculateProfitBreakdown(values: ProfitComponents): {
@@ -32,7 +33,8 @@ export function calculateProfitBreakdown(values: ProfitComponents): {
     cents(values.processingFees) + cents(values.adSpend) +
     cents(values.operationalExpenses) + cents(values.refunds) +
     cents(values.disputeValue) + cents(values.disputeFees) -
-    cents(values.disputeRecovered) - cents(values.disputeFeesRecovered);
+    cents(values.disputeRecovered) - cents(values.disputeFeesRecovered) -
+    cents(values.disputeProtectionNet ?? 0);
   const profitCents = cents(values.revenue) - costCents;
   return {
     totalCosts: costCents / 100,

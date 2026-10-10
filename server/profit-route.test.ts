@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   getStoreById: vi.fn(),
   getShopifyConnectionByStoreId: vi.fn(),
   getFacebookConnectionsByStoreId: vi.fn(),
+  getFacebookConnectionsForUser: vi.fn(),
   getCogsConfigByStoreId: vi.fn(),
   getShippingConfigByStoreId: vi.fn(),
   getProcessingFeesConfigByStoreId: vi.fn(),
@@ -13,12 +14,14 @@ const mocks = vi.hoisted(() => ({
   fetchShopifyDisputes: vi.fn(),
   fetchShopifyBalanceTransactions: vi.fn(),
   getEurUsdRate: vi.fn(),
+  fetchFacebookAdSpend: vi.fn(),
 }));
 vi.mock("./db", async importOriginal => ({
   ...(await importOriginal<typeof import("./db")>()),
   getStoreById: mocks.getStoreById,
   getShopifyConnectionByStoreId: mocks.getShopifyConnectionByStoreId,
   getFacebookConnectionsByStoreId: mocks.getFacebookConnectionsByStoreId,
+  getFacebookConnectionsForUser: mocks.getFacebookConnectionsForUser,
   getCogsConfigByStoreId: mocks.getCogsConfigByStoreId,
   getShippingConfigByStoreId: mocks.getShippingConfigByStoreId,
   getProcessingFeesConfigByStoreId: mocks.getProcessingFeesConfigByStoreId,
@@ -34,6 +37,7 @@ vi.mock("./exchange-rate", async importOriginal => ({
   ...(await importOriginal<typeof import("./exchange-rate")>()),
   getEurUsdRate: mocks.getEurUsdRate,
 }));
+vi.mock("./facebook-data", () => ({ fetchFacebookAdSpend: mocks.fetchFacebookAdSpend }));
 
 import { appRouter } from "./routers";
 const context = (): TrpcContext => ({
@@ -50,6 +54,8 @@ beforeEach(() => {
     shopDomain: "store.myshopify.com", accessToken: "mock", apiVersion: "2026-07", scopes: "read_orders,read_shopify_payments_payouts,read_shopify_payments_disputes",
   });
   mocks.getFacebookConnectionsByStoreId.mockResolvedValue([]);
+  mocks.getFacebookConnectionsForUser.mockResolvedValue([]);
+  mocks.fetchFacebookAdSpend.mockResolvedValue({ spend: 10, currency: "EUR" });
   mocks.getCogsConfigByStoreId.mockResolvedValue([{ variantId: "1", cogsValue: "20", currency: "USD" }]);
   mocks.getShippingConfigByStoreId.mockResolvedValue([{
     variantId: "1", configJson: JSON.stringify({ currency: "USD", rates: { US: { Standard: { "1": 5 } } } }),
@@ -77,6 +83,38 @@ beforeEach(() => {
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it("uses captured partial-payment revenue, flags real outside gateways/taxes and includes end-date expenses", async () => {
+    const orders = await mocks.fetchShopifyOrders();
+    mocks.fetchShopifyOrders.mockResolvedValue([{ ...orders[0], financial_status: 'partially_paid', captured_gross: 40, total_tax: '2.50', payment_gateway_names: ['paypal'] }]);
+    mocks.getOperationalExpensesByStoreId.mockResolvedValue([{ type: 'one_time', amount: '4', date: new Date('2026-10-02T18:00:00Z') }]);
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.revenue).toBe(40);
+    expect(result.operationalExpenses).toBe(4);
+    expect(result.dataQuality.warnings.join(' ')).toContain('partially paid');
+    expect(result.dataQuality.warnings.join(' ')).toContain('paypal');
+    expect(result.dataQuality.warnings.join(' ')).toContain('sales tax');
+  });
+
+  it("marks EUR advertising as estimated FX and warns about charging a shared ad account twice", async () => {
+    mocks.getFacebookConnectionsByStoreId.mockResolvedValue([{ adAccountId: "act_123", accessToken: "mock" }, { adAccountId: "123", accessToken: "mock" }]);
+    mocks.getFacebookConnectionsForUser.mockResolvedValue([{ storeId: 43, storeName: "Other store", adAccountId: "123" }]);
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.adSpend).toBe(12);
+    expect(mocks.fetchFacebookAdSpend).toHaveBeenCalledTimes(1);
+    expect(result.dataQuality.fxApproximate).toBe(true);
+    expect(result.dataQuality.paymentsVerified).toBe(true); // USD Shopify ledger is still verified independently.
+    expect(result.dataQuality.warnings.join(" ")).toContain("count ads twice");
+  });
+
+  it("adds a posted protection reimbursement without manufacturing principal or fee recoveries", async () => {
+    const ledger = await mocks.fetchShopifyBalanceTransactions();
+    mocks.fetchShopifyBalanceTransactions.mockResolvedValue({ ...ledger, totalDisputeRecovered: 0, totalDisputeFeesRecovered: 0, disputeProtectionNet: 115 });
+    const result = await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.disputeProtectionNet).toBe(115);
+    expect(result.disputeRecovered).toBe(0);
+    expect(result.disputeFeesRecovered).toBe(0);
+    expect(result.netProfit).toBe(52);
+  });
   it("groups assigned profile quantities and warns when the selected method is unset", async () => {
     mocks.fetchShopifyOrders.mockResolvedValue([{
       id: "42", order_number: 42, created_at: "2026-10-02T15:00:00Z", total_price: "100", currency: "USD",

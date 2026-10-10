@@ -287,6 +287,7 @@ export default function StoreView() {
                   Sales and product costs follow the order creation date; payment fees, refunds,
                   dispute debits and recoveries follow Shopify Payments' processed date.
                   Case outcomes below show their current status for disputes initiated in this range.
+                  Order contribution excludes refunds, disputes, ad spend and operational expenses.
                 </p>
                 {metrics.dataQuality.warnings.length > 0 && (
                   <Card className="glass border-amber-500/40">
@@ -301,7 +302,7 @@ export default function StoreView() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                   <Card className="card-glow">
                     <CardContent className="p-6">
-                      <p className="text-sm text-muted-foreground mb-2">Total Revenue</p>
+                      <p className="text-sm text-muted-foreground mb-2">Gross Order Revenue</p>
                       <p className="text-3xl font-bold gold-text">
                         {formatCurrencyUSD(metrics.revenue)}
                       </p>
@@ -438,7 +439,7 @@ export default function StoreView() {
                     <CardContent className="p-4 space-y-2">
                       <h3 className="font-semibold text-sm text-green-500 mb-3">Dispute credits (posted)</h3>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground text-sm">Value Recovered</span>
+                        <span className="text-muted-foreground text-sm">Principal recovered</span>
                         <div className="text-right">
                           <div className={`font-semibold text-sm ${(metrics.disputeRecovered || 0) > 0 ? 'text-green-500' : ''}`}>
                             {(metrics.disputeRecovered || 0) > 0 ? '+' : ''}{formatCurrencyUSD(metrics.disputeRecovered || 0)}
@@ -459,10 +460,16 @@ export default function StoreView() {
                           </div>
                         </div>
                       </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted-foreground text-sm">Protection reimbursements (net)</span>
+                        <div className={`font-semibold text-sm ${(metrics.disputeProtectionNet || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                          {formatCurrencyUSD(metrics.disputeProtectionNet || 0)}
+                        </div>
+                      </div>
                       <div className="border-t border-border/50 pt-2 mt-2 flex items-center justify-between">
                         <span className="text-muted-foreground text-sm font-medium">Subtotal</span>
-                        <div className={`font-semibold text-sm ${((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0)) > 0 ? 'text-green-500' : ''}`}>
-                          {((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0)) > 0 ? '+' : ''}{formatCurrencyUSD((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0))}
+                        <div className={`font-semibold text-sm ${((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0) + (metrics.disputeProtectionNet || 0)) > 0 ? 'text-green-500' : ''}`}>
+                          {((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0) + (metrics.disputeProtectionNet || 0)) > 0 ? '+' : ''}{formatCurrencyUSD((metrics.disputeRecovered || 0) + (metrics.disputeFeesRecovered || 0) + (metrics.disputeProtectionNet || 0))}
                         </div>
                       </div>
                     </CardContent>
@@ -506,6 +513,31 @@ export default function StoreView() {
 
                 <Card className="glass">
                   <CardContent className="p-4 space-y-2">
+                    <h3 className="font-semibold text-sm">Disputes in Shopify payout currencies</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Actual postings without currency conversion. Net loss = debits + fees − recoveries − fee refunds − protection credits.
+                      A negative net loss is a credit. Inquiries affect these totals only when Shopify posts money.
+                      Protection reimbursements can include fees; Shopify's net posting is counted once.
+                    </p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-right">
+                        <thead><tr><th className="p-2 text-left">Currency</th><th className="p-2">Debits</th><th className="p-2">Fees</th><th className="p-2">Recovered</th><th className="p-2">Fees refunded</th><th className="p-2">Protection net</th><th className="p-2">Net loss</th></tr></thead>
+                        <tbody>{Object.entries(metrics.ledgerByCurrency).map(([currency, totals]) => {
+                          const money = (value: number) => new Intl.NumberFormat("en-US", { style: "currency", currency }).format(value);
+                          return <tr key={currency} className="border-t border-border/50">
+                            <td className="p-2 text-left font-semibold">{currency}</td>
+                            <td className="p-2">{money(totals.disputeDebits)}</td><td className="p-2">{money(totals.disputeFees)}</td>
+                            <td className="p-2">{money(totals.disputeRecoveries)}</td><td className="p-2">{money(totals.disputeFeeRecoveries)}</td>
+                            <td className="p-2">{money(totals.disputeProtectionNet)}</td><td className="p-2 font-semibold">{money(totals.disputeNetLoss)}</td>
+                          </tr>;
+                        })}</tbody>
+                      </table>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="glass">
+                  <CardContent className="p-4 space-y-2">
                     <h3 className="font-semibold text-sm text-amber-500">Dispute case outcomes</h3>
                     <p className="text-xs text-muted-foreground">
                       Current status of cases initiated in this range — won: {metrics.disputeCases.won},
@@ -544,7 +576,7 @@ export default function StoreView() {
                         </div>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground">Average Profit per Order{metrics.dataQuality.perOrderFeeEstimates ? " (estimated fees)" : ""}</span>
+                        <span className="text-muted-foreground">Average Order Contribution{metrics.dataQuality.perOrderFeeEstimates ? " (estimated fees)" : ""}</span>
                         <div className="text-right">
                           <div className="font-semibold">
                             {formatCurrencyUSD(metrics.averageOrderProfit || 0)}
@@ -555,7 +587,7 @@ export default function StoreView() {
                         </div>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-muted-foreground">Average Profit Margin per Order</span>
+                        <span className="text-muted-foreground">Average Order Contribution Margin</span>
                         <span className={`font-semibold ${(metrics.averageOrderProfitMargin || 0) >= 0 ? "text-green-500" : "text-red-500"}`}>
                           {(metrics.averageOrderProfitMargin || 0).toFixed(1)}%
                         </span>

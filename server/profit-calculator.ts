@@ -27,6 +27,7 @@ interface ShopifyOrder {
   total_price: string;
   currency: string;
   financial_status?: string | null;
+  captured_gross?: number;
   test?: boolean;
   total_discounts?: string;
   customer?: {
@@ -226,14 +227,14 @@ export function processOrders(
     // originally paid/refunded order's gross sale, then book its actual refund
     // once on the ledger processing date.
     if (order.test || ["pending", "authorized", "voided"].includes(order.financial_status || "")) continue;
-    if (order.financial_status === "partially_paid") {
+    if (order.financial_status === "partially_paid" && order.captured_gross === undefined) {
       throw new Error("Partially paid Shopify orders need captured-payment accounting before profit can be verified");
     }
-    if (!["paid", "partially_refunded", "refunded"].includes(order.financial_status || "")) {
+    if (!["paid", "partially_paid", "partially_refunded", "refunded"].includes(order.financial_status || "")) {
       throw new Error(`Shopify order has an unsupported payment status: ${order.financial_status ?? "missing"}`);
     }
     if (order.currency !== "USD") throw new Error(`Unsupported order currency: ${order.currency}`);
-    const val = Number(order.total_price);
+    const val = order.financial_status === "partially_paid" ? Number(order.captured_gross) : Number(order.total_price);
     if (!Number.isFinite(val) || val < 0) throw new Error("Shopify order has an invalid total price");
     revenue += val;
 

@@ -10,6 +10,9 @@ interface ShopifyOrder {
   test?: boolean;
   cancelled_at?: string | null;
   fulfillment_status?: string | null;
+  total_tax?: string;
+  payment_gateway_names?: string[];
+  captured_gross?: number;
   customer?: { first_name?: string; last_name?: string };
   line_items: any[];
   shipping_address?: { country?: string };
@@ -66,12 +69,39 @@ export async function fetchShopifyOrders(
   url.searchParams.set("created_at_min", new Date(start).toISOString());
   // Shopify's upper bound is inclusive: fetch next midnight, then exclude it locally.
   url.searchParams.set("created_at_max", new Date(end).toISOString());
-  url.searchParams.set("fields", "id,order_number,created_at,total_price,currency,customer,line_items,shipping_address,shipping_lines,total_discounts,total_tip_received,financial_status,test,cancelled_at,fulfillment_status");
-  return shopifyList<ShopifyOrder>(url, accessToken, "orders", order => {
+  url.searchParams.set("fields", "id,order_number,created_at,total_price,total_tax,currency,customer,line_items,shipping_address,shipping_lines,total_discounts,total_tip_received,financial_status,test,cancelled_at,fulfillment_status,payment_gateway_names");
+  const orders = await shopifyList<ShopifyOrder>(url, accessToken, "orders", order => {
     const created = Date.parse(order.created_at);
     if (!Number.isFinite(created)) throw new Error("Shopify returned an order without a valid date");
     return created >= start && created < end;
   });
+  for (const order of orders) {
+    if (order.test || order.financial_status !== "partially_paid") continue;
+    if (!/^\d+$/.test(String(order.id))) throw new Error("Shopify order has an invalid ID");
+    const transactionsUrl = new URL(`https://${shopDomain}/admin/api/${apiVersion}/orders/${order.id}/transactions.json`);
+    // Multi-currency transactions default to presentment currency. Shopify
+    // documents this parameter for reading captured amounts in shop currency.
+    transactionsUrl.searchParams.set("in_shop_currency", "true");
+    transactionsUrl.searchParams.set("fields", "id,amount,currency,kind,status,test");
+    const response = await fetch(transactionsUrl, { headers: { "X-Shopify-Access-Token": accessToken } });
+    if (!response.ok) throw new Error(`Shopify captured-payment API returned HTTP ${response.status}`);
+    const transactions = (await response.json()).transactions;
+    if (!Array.isArray(transactions) || response.headers.get("Link")) throw new Error("Shopify captured-payment response is incomplete");
+    const seen = new Set<number>();
+    let capturedCents = 0;
+    for (const transaction of transactions) {
+      if (transaction.test || transaction.status !== "success" ||
+          !["sale", "capture"].includes(transaction.kind)) continue;
+      if (!Number.isSafeInteger(transaction.id) || transaction.id <= 0) throw new Error("Shopify captured payment has an invalid ID");
+      if (seen.has(transaction.id)) continue;
+      seen.add(transaction.id);
+      const amount = money(transaction.amount, "captured amount");
+      if (transaction.currency !== order.currency || amount < 0) throw new Error("Shopify captured payment does not match shop currency");
+      capturedCents += Math.round(amount * 100);
+    }
+    order.captured_gross = capturedCents / 100;
+  }
+  return orders;
 }
 
 export type DisputeStatus = "won" | "lost" | "accepted" | "charge_refunded" |
@@ -156,6 +186,7 @@ export interface BalanceTransaction {
   source_order_id?: number | null;
   source_order_transaction_id?: number | null;
   source_type?: string | null;
+  adjustment_reason?: string | null;
   currency: string;
   processed_at: string;
   test?: boolean;
@@ -170,6 +201,8 @@ export interface BalanceSummary {
   /** Principal credited, not necessarily every case currently marked won. */
   totalDisputeRecovered: number;
   totalDisputeFeesRecovered: number;
+  /** Protection reimbursements are separate net credits, sometimes bundling principal and fees. */
+  disputeProtectionNet: number;
   /** Signed refund principal (credits/reversals reduce this number). */
   totalRefunds: number;
   refundFeeAdjustments: number;
@@ -179,6 +212,19 @@ export interface BalanceSummary {
   unclassifiedSignedNet: number;
   unclassifiedCount: number;
   holdMovement: number;
+  byCurrency: Record<string, NativeBalanceTotals>;
+}
+
+export interface NativeBalanceTotals {
+  processingFees: number;
+  refunds: number;
+  disputeDebits: number;
+  disputeFees: number;
+  disputeRecoveries: number;
+  disputeFeeRecoveries: number;
+  disputeProtectionNet: number;
+  disputeNetLoss: number;
+  unclassifiedNet: number;
 }
 
 function money(value: string | number | undefined, label: string): number {
@@ -203,9 +249,10 @@ export function summarizeBalanceTransactions(
   const totals: Omit<BalanceSummary, "pageCount"> = {
     orderFees: new Map(), chargeFeesTotal: 0, totalDisputeValue: 0, totalDisputeFees: 0,
     totalDisputeRecovered: 0, totalDisputeFeesRecovered: 0,
+    disputeProtectionNet: 0,
     totalRefunds: 0, refundFeeAdjustments: 0, fxApproximate: false,
     unclassifiedTypes: [], unclassifiedSignedNet: 0, unclassifiedCount: 0,
-    holdMovement: 0,
+    holdMovement: 0, byCurrency: {},
   };
   const seen = new Set<number>();
   const unknown = new Set<string>();
@@ -222,9 +269,18 @@ export function summarizeBalanceTransactions(
     const value = usd(amount, currency, eurToUsdRate);
     const feeUsd = usd(fee, currency, eurToUsdRate);
     const netUsd = usd(net, currency, eurToUsdRate);
+    const native = totals.byCurrency[currency] ??= {
+      processingFees: 0, refunds: 0, disputeDebits: 0, disputeFees: 0,
+      disputeRecoveries: 0, disputeFeeRecoveries: 0, disputeProtectionNet: 0,
+      disputeNetLoss: 0, unclassifiedNet: 0,
+    };
     if (currency === "EUR") totals.fxApproximate = true;
     const type = String(row.type || "").toLowerCase().replace(/\s+/g, "_");
     const source = String(row.source_type || "").toLowerCase();
+    const reason = String(row.adjustment_reason || "").toLowerCase();
+    const protection = /^(chargeback_protection|seller_protection)_(credit|debit)(_reversal)?$/.test(type) ||
+      (["credit", "debit", "adjustment"].includes(type) &&
+        ["chargeback_protection", "seller_protection"].includes(reason));
     const standaloneFee = type === "chargeback_fee" || type === "chargeback_fee_refund";
     const hold = type === "chargeback_hold" || type === "chargeback_hold_release" ||
       type === "reserve" || type.startsWith("reserved_funds") ||
@@ -233,26 +289,56 @@ export function summarizeBalanceTransactions(
       type === "dispute_withdrawal" || type === "dispute_reversal" ||
       type === "chargeback_reversal" || type === "chargeback_won" ||
       (type === "adjustment" && source.includes("dispute"));
+    const refund = ["refund", "refund_adjustment", "refund_failure"].includes(type) ||
+      (type === "adjustment" && (source === "refund" || source === "payments::refund"));
     if (hold) {
       totals.holdMovement += netUsd;
+    } else if (protection) {
+      // Shopify may reimburse principal and fees together. Use the canonical
+      // net credit; do not invent a split or also count adjustment child rows.
+      totals.disputeProtectionNet += netUsd;
+      native.disputeProtectionNet += net;
     } else if (standaloneFee) {
       // A standalone fee row's net is the fee debit or refund; its fee field
       // may be zero because the fee is represented as gross amount instead.
       if (netUsd < 0) totals.totalDisputeFees -= netUsd;
       else totals.totalDisputeFeesRecovered += netUsd;
+      if (net < 0) native.disputeFees -= net;
+      else native.disputeFeeRecoveries += net;
     } else if (dispute) {
-      if (Math.abs(amount - fee - net) > 0.02) {
+      if (Math.round(amount * 100) - Math.round(fee * 100) !== Math.round(net * 100)) {
         throw new Error("Shopify dispute balance row did not reconcile: net differs from amount minus fee");
       }
       if (value < 0) totals.totalDisputeValue -= value;
       else totals.totalDisputeRecovered += value;
-      if (feeUsd > 0) totals.totalDisputeFees += feeUsd;
-      else totals.totalDisputeFeesRecovered -= feeUsd;
-    } else if (type === "refund" || type === "refund_adjustment" || type === "refund_failure") {
+      // Allocate conversion rounding to fees so the components still equal
+      // Shopify's converted net posting exactly, even for EUR estimates.
+      const effectiveFee = Math.round((value - netUsd) * 100) / 100;
+      if (effectiveFee > 0) totals.totalDisputeFees += effectiveFee;
+      else totals.totalDisputeFeesRecovered -= effectiveFee;
+      if (amount < 0) native.disputeDebits -= amount;
+      else native.disputeRecoveries += amount;
+      if (fee > 0) native.disputeFees += fee;
+      else native.disputeFeeRecoveries -= fee;
+    } else if (refund) {
+      if (Math.round(amount * 100) - Math.round(fee * 100) !== Math.round(net * 100)) {
+        throw new Error("Shopify refund balance row did not reconcile: net differs from amount minus fee");
+      }
       totals.totalRefunds -= value;
-      totals.refundFeeAdjustments += feeUsd;
+      totals.refundFeeAdjustments += Math.round((value - netUsd) * 100) / 100;
+      native.refunds -= amount;
+      native.processingFees += fee;
+    } else if (type === "stripe_fee") {
+      // These additional processor fees are debited as the row's net amount,
+      // commonly with fee=0. A reversed debit reduces the fee expense.
+      totals.chargeFeesTotal -= netUsd;
+      native.processingFees -= net;
     } else if (type === "charge") {
+      if (Math.round(amount * 100) - Math.round(fee * 100) !== Math.round(net * 100)) {
+        throw new Error("Shopify charge balance row did not reconcile: net differs from amount minus fee");
+      }
       totals.chargeFeesTotal += feeUsd;
+      native.processingFees += fee;
       const orderId = Number(row.source_order_id);
       if (Number.isSafeInteger(orderId) && orderId > 0) {
         totals.orderFees.set(orderId, (totals.orderFees.get(orderId) ?? 0) + feeUsd);
@@ -267,9 +353,19 @@ export function summarizeBalanceTransactions(
       unknown.add(type || "missing_type");
       totals.unclassifiedSignedNet += netUsd;
       totals.unclassifiedCount++;
+      native.unclassifiedNet += net;
     }
   }
   totals.unclassifiedTypes = Array.from(unknown).sort();
+  for (const key of Object.keys(totals) as (keyof typeof totals)[]) {
+    if (typeof totals[key] === "number") (totals as any)[key] = Math.round((totals[key] as number) * 100) / 100;
+  }
+  for (const [id, fee] of Array.from(totals.orderFees)) totals.orderFees.set(id, Math.round(fee * 100) / 100);
+  for (const native of Object.values(totals.byCurrency)) {
+    for (const key of Object.keys(native) as (keyof NativeBalanceTotals)[]) native[key] = Math.round(native[key] * 100) / 100;
+    native.disputeNetLoss = Math.round((native.disputeDebits + native.disputeFees -
+      native.disputeRecoveries - native.disputeFeeRecoveries - native.disputeProtectionNet) * 100) / 100;
+  }
   return totals;
 }
 

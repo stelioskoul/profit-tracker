@@ -51,6 +51,55 @@ describe("Shopify dispute API", () => {
 });
 
 describe("Shopify Payments ledger", () => {
+  it("includes legacy and current protection reimbursements once, using their net rather than inventing a fee split", () => {
+    const postings = [
+      row({ id: 1, type: "dispute", amount: "-100", fee: "15", net: "-115" }),
+      row({ id: 2, type: "credit", adjustment_reason: "chargeback_protection", amount: "115", fee: "0", net: "115" }),
+      row({ id: 3, type: "seller_protection_credit", amount: "20", fee: "0", net: "20" }),
+      row({ id: 4, type: "seller_protection_credit_reversal", amount: "-20", fee: "0", net: "-20" }),
+    ];
+    const result = summarizeBalanceTransactions([...postings, postings[1]], 1.2);
+    expect(result.disputeProtectionNet).toBe(115);
+    expect(result.totalDisputeRecovered).toBe(0);
+    expect(result.totalDisputeFeesRecovered).toBe(0);
+    expect(result.byCurrency.USD.disputeNetLoss).toBe(0);
+    expect(result.unclassifiedTypes).toEqual([]);
+  });
+
+  it("books additional processor-fee debits and reversals, plus legacy refund adjustments", () => {
+    const result = summarizeBalanceTransactions([
+      row({ id: 1, type: "stripe_fee", amount: "-25", fee: "0", net: "-25" }),
+      row({ id: 2, type: "stripe_fee", amount: "5", fee: "0", net: "5" }),
+      row({ id: 3, type: "adjustment", source_type: "Payments::Refund", amount: "-30", fee: "-1", net: "-29" }),
+      row({ id: 4, type: "refund_failure", amount: "30", fee: "0", net: "30" }),
+    ], 1.2);
+    expect(result.chargeFeesTotal + result.refundFeeAdjustments).toBe(19);
+    expect(result.totalRefunds).toBe(0);
+    expect(result.byCurrency.USD.processingFees).toBe(19);
+    expect(result.unclassifiedTypes).toEqual([]);
+  });
+
+  it("reconciles partial wins and fees in original payout currencies, conserving converted net to the cent", () => {
+    const postings = [
+      row({ id: 1, type: "dispute", amount: "-100", fee: "15", net: "-115", currency: "EUR" }),
+      row({ id: 2, type: "dispute", amount: "23.17", fee: "-15", net: "38.17", currency: "EUR" }),
+      row({ id: 3, type: "dispute", amount: "-10.03", fee: "1.09", net: "-11.12", currency: "USD" }),
+    ];
+    const rate = 1.1665;
+    const result = summarizeBalanceTransactions(postings, rate);
+    expect(result.byCurrency.EUR).toMatchObject({ disputeDebits: 100, disputeFees: 15, disputeRecoveries: 23.17, disputeFeeRecoveries: 15, disputeNetLoss: 76.83 });
+    expect(result.byCurrency.USD.disputeNetLoss).toBe(11.12);
+    const independentNetCostCents = -postings.reduce((sum, p) => sum + Math.round(Number(p.net) * (p.currency === "EUR" ? rate : 1) * 100), 0);
+    expect(Math.round((result.totalDisputeValue + result.totalDisputeFees - result.totalDisputeRecovered - result.totalDisputeFeesRecovered) * 100)).toBe(independentNetCostCents);
+    expect(result.fxApproximate).toBe(true);
+  });
+
+  it("rejects even a one-cent mismatch in charges, refunds or dispute postings", () => {
+    for (const type of ["charge", "refund", "dispute"]) {
+      expect(() => summarizeBalanceTransactions([row({ type, net: "97.09" })], 1.2)).toThrow("reconcile");
+    }
+  });
+
   it("classifies fees and principal by signed posted entries rather than current dispute status", () => {
     const result = summarizeBalanceTransactions([
       row(),
@@ -129,6 +178,27 @@ describe("Shopify Payments ledger", () => {
 });
 
 describe("Shopify orders", () => {
+  it("reads partial payments in shop currency and counts successful sales/captures without authorizations or refunds", async () => {
+    const mock = vi.fn(async (input: string | URL) => {
+      const url = new URL(input);
+      if (url.pathname.endsWith('/transactions.json')) {
+        expect(url.searchParams.get('in_shop_currency')).toBe('true');
+        return reply({ transactions: [
+          { id: 1, kind: 'authorization', status: 'success', amount: '100', currency: 'USD' },
+          { id: 2, kind: 'capture', status: 'success', amount: '25', currency: 'USD' },
+          { id: 3, kind: 'sale', status: 'success', amount: '10', currency: 'USD' },
+          { id: 4, kind: 'capture', status: 'failure', amount: '65', currency: 'USD' },
+          { id: 5, kind: 'refund', status: 'success', amount: '5', currency: 'USD' },
+        ] });
+      }
+      return reply({ orders: [{ id: '42', financial_status: 'partially_paid', created_at: '2026-10-01T12:00:00Z', total_price: '100', currency: 'USD' }] });
+    });
+    vi.stubGlobal('fetch', mock);
+    const orders = await fetchShopifyOrders('test.myshopify.com', 'token', range);
+    expect(orders[0].captured_gross).toBe(35);
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
   it("applies a DST-aware range and excludes the next day's midnight", async () => {
     const mock = vi.fn(async (input: string) => {
       const url = new URL(input);

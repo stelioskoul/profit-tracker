@@ -16,6 +16,7 @@ import { processOrders, calculateOperationalExpensesForPeriod } from "./profit-c
 import { calculateProfitBreakdown } from "./profit-formula";
 import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
 import { assertOrderHistoryAccess } from "./shopify-order-access";
+import { fetchStripeLedger, verifyStripeConnection } from './stripe-data';
 import { getEurUsdRate, getCachedRate } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
 
@@ -490,6 +491,34 @@ export const appRouter = router({
         };
       }),
   }),
+  stripe: router({
+    getConnection: protectedProcedure.input(z.object({ storeId: z.number() })).query(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      const connection = await db.getStripeConnectionByStoreId(input.storeId);
+      if (!connection) return null;
+      return { accountId: connection.accountId, accountName: connection.accountName, shopDomain: connection.shopDomain, connectedAt: connection.connectedAt };
+    }),
+    connect: protectedProcedure.input(z.object({ storeId: z.number(), apiKey: z.string().trim().regex(/^rk_live_[A-Za-z0-9]+$/, 'Use a live restricted Stripe key') })).mutation(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      const shopify = await db.getShopifyConnectionByStoreId(input.storeId);
+      if (!shopify) throw new TRPCError({ code: 'BAD_REQUEST', message: 'Connect Shopify before connecting its separate Stripe account' });
+      try {
+        const account = await verifyStripeConnection(input.apiKey, shopify.shopDomain);
+        await db.upsertStripeConnection({ storeId: input.storeId, shopDomain: shopify.shopDomain, apiKey: input.apiKey, ...account });
+      } catch (error) {
+        throw new TRPCError({ code: 'BAD_REQUEST', message: (error as Error).message });
+      }
+      return { success: true };
+    }),
+    disconnect: protectedProcedure.input(z.object({ storeId: z.number() })).mutation(async ({ ctx, input }) => {
+      const store = await db.getStoreById(input.storeId);
+      if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
+      await db.deleteStripeConnection(input.storeId);
+      return { success: true };
+    }),
+  }),
   facebook: router({
     getAuthUrl: protectedProcedure
       .input(z.object({ storeId: z.number() }))
@@ -686,6 +715,7 @@ export const appRouter = router({
         }
         const shopifyConn = await db.getShopifyConnectionByStoreId(input.storeId);
         const facebookConns = await db.getFacebookConnectionsByStoreId(input.storeId);
+        const stripeConn = await db.getStripeConnectionByStoreId(input.storeId);
         const rate = await getEurUsdRate();
         const warnings: string[] = [];
         let processed: ReturnType<typeof processOrders> = {
@@ -711,6 +741,10 @@ export const appRouter = router({
         let perOrderFeeEstimates = 0;
         let ledgerByCurrency: Record<string, NativeBalanceTotals> = {};
         let ledgerFxApproximate = false;
+        let stripeLedgerByCurrency: Record<string, NativeBalanceTotals> = {};
+        let stripeLedgerPages = 0;
+        let stripeProcessingFees = 0;
+        let outsideGatewaysMissing: string[] = [];
 
         if (shopifyConn) {
           if (store.currency !== "USD") {
@@ -746,10 +780,32 @@ export const appRouter = router({
           fxApproximate = ledger.fxApproximate;
           ledgerFxApproximate = ledger.fxApproximate;
           ledgerByCurrency = ledger.byCurrency ?? {};
-          warnings.push("The Shopify Payments ledger does not contain fees, refunds or disputes from PayPal or other outside payment gateways. Reconcile those separately if used.");
+          warnings.push("The Shopify Payments ledger covers Shopify Payments only. Separate provider ledgers are required for PayPal and other gateways, including later refunds or disputes on older orders.");
           // Charge fees and refund fee adjustments are recognized on their
           // balance-transaction processed_at date, including for old orders.
           processingFees = ledger.chargeFeesTotal + ledger.refundFeeAdjustments;
+          if (stripeConn) {
+            if (stripeConn.shopDomain !== shopifyConn.shopDomain) throw new Error('Stripe is connected to a different Shopify store');
+            const stripe = await fetchStripeLedger(stripeConn.apiKey, stripeConn.shopDomain, period, rate, offset, store.timezone);
+            stripeLedgerByCurrency = stripe.byCurrency;
+            stripeLedgerPages = stripe.pageCount;
+            stripeProcessingFees = stripe.reporting.processingFees;
+            processingFees += stripeProcessingFees;
+            refunds += stripe.reporting.refunds;
+            disputeValue += stripe.reporting.disputeDebits;
+            disputeFees += stripe.reporting.disputeFees;
+            disputeRecovered += stripe.reporting.disputeRecoveries;
+            disputeFeesRecovered += stripe.reporting.disputeFeeRecoveries;
+            ledgerFxApproximate ||= stripe.fxApproximate;
+            fxApproximate ||= stripe.fxApproximate;
+            if (stripe.unclassifiedCount) {
+              unclassifiedTypes.push(...stripe.unclassifiedTypes.map(type => `Stripe:${type}`));
+              unreconciledLedgerCount += stripe.unclassifiedCount;
+              unreconciledLedgerNet += stripe.reporting.unclassifiedNet;
+              warnings.push(`${stripe.unclassifiedCount} Stripe postings were excluded because their operating-profit treatment is unknown.`);
+            }
+            warnings.push('Separate Stripe gateway postings are included by their creation date. Stripe charge revenue is not added again. Standalone Stripe fees and fee credits include dispute-response fees; those are counted once in provider fees.');
+          }
           if (ledger.holdMovement !== 0) {
             warnings.push("Shopify held/released funds are excluded from operating profit; they are not a finalized loss.");
           }
@@ -801,7 +857,8 @@ export const appRouter = router({
             ["paid", "partially_paid", "partially_refunded", "refunded"].includes(order.financial_status || ""));
           const outsideGateways = Array.from(new Set(sales.flatMap(order => order.payment_gateway_names ?? [])
             .filter(gateway => gateway !== "shopify_payments")));
-          if (outsideGateways.length) warnings.push(`Orders in this range use outside gateways: ${outsideGateways.join(", ")}. Their revenue is included, but their actual fees, refunds and disputes require a separate provider connection.`);
+          outsideGatewaysMissing = outsideGateways.filter(gateway => !(stripeConn && gateway === 'Stripe Card Payments'));
+          if (outsideGatewaysMissing.length) warnings.push(`Orders in this range use unconnected outside gateways: ${outsideGatewaysMissing.join(", ")}. Their revenue is included, but their actual fees, refunds and disputes require a separate provider connection.`);
           const taxCollected = sales.reduce((sum, order) => sum + Number(order.total_tax ?? 0), 0);
           if (!Number.isFinite(taxCollected)) throw new Error("Shopify order has an invalid tax amount");
           if (taxCollected > 0) warnings.push(`Shopify reports ${taxCollected.toFixed(2)} USD sales tax on orders in this range. Gross revenue, tax liabilities and refunded taxes are not reconciled as accounting income or expense.`);
@@ -829,7 +886,7 @@ export const appRouter = router({
           perOrderFeeEstimates = processed.processedOrders.filter(
             order => order.processingFeeSource === "estimated").length;
           if (perOrderFeeEstimates) {
-            warnings.push(`${perOrderFeeEstimates} per-order fee figures are estimates; period processing fees use actual posted Shopify Payments fees only. Other payment gateways are not included.`);
+            warnings.push(`${perOrderFeeEstimates} per-order fee figures are estimates. Period fees use actual postings from connected providers; per-order estimates are not charged again in period profit.`);
           }
         } else {
           warnings.push("Connect this store to Shopify to fetch orders, payment fees, refunds and disputes. Zero is not a verified profit figure.");
@@ -907,6 +964,10 @@ export const appRouter = router({
           disputeProtectionNet,
           refunds,
           ledgerByCurrency,
+          stripeLedgerByCurrency,
+          stripeLedgerPages,
+          stripeProcessingFees,
+          stripeConnected: !!stripeConn,
           operationalExpenses,
           exchangeRateUsed: rate,
           totalCosts: breakdown.totalCosts,
@@ -926,7 +987,7 @@ export const appRouter = router({
           },
           dataQuality: {
             shopifyConnected: !!shopifyConn,
-            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !ledgerFxApproximate,
+            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !ledgerFxApproximate && !outsideGatewaysMissing.length,
             ledgerPages,
             fxApproximate,
             perOrderFeeEstimates,
@@ -934,7 +995,7 @@ export const appRouter = router({
             unreconciledLedgerNet,
             unreconciledLedgerCount,
             warnings,
-            basis: "Orders by created date; fees/refunds/dispute debits and credits by Shopify Payments processed date",
+            basis: "Orders by created date; Shopify Payments postings by processed date; separate Stripe postings by created date",
           },
         };
       }),

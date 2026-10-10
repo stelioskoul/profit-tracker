@@ -8,6 +8,8 @@ import {
   InsertStore,
   shopifyConnections,
   InsertShopifyConnection,
+  stripeConnections,
+  InsertStripeConnection,
   facebookConnections,
   InsertFacebookConnection,
   cogsConfig,
@@ -239,6 +241,34 @@ export async function deleteShopifyConnection(storeId: number) {
   if (!db) throw new Error("Database not available");
 
   await db.delete(shopifyConnections).where(eq(shopifyConnections.storeId, storeId));
+}
+
+export async function getStripeConnectionByStoreId(storeId: number) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  const [connection] = await db.select().from(stripeConnections).where(eq(stripeConnections.storeId, storeId)).limit(1);
+  return connection ? { ...connection, apiKey: decryptToken(connection.apiKey) } : undefined;
+}
+
+export async function upsertStripeConnection(connection: InsertStripeConnection) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  const apiKey = encryptToken(connection.apiKey);
+  try {
+    await db.insert(stripeConnections).values({ ...connection, apiKey }).onConflictDoUpdate({
+      target: stripeConnections.storeId,
+      set: { accountId: connection.accountId, accountName: connection.accountName,
+        shopDomain: connection.shopDomain, apiKey, connectedAt: new Date() },
+    });
+  } catch {
+    throw new Error('Could not save Stripe. Its account may already be connected to another store profile.');
+  }
+}
+
+export async function deleteStripeConnection(storeId: number) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  await db.delete(stripeConnections).where(eq(stripeConnections.storeId, storeId));
 }
 
 // ============================================================================

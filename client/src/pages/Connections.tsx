@@ -17,6 +17,16 @@ export default function Connections() {
   const [, setLocation] = useLocation();
   const { isAuthenticated, loading } = useAuth();
   const utils = trpc.useUtils();
+  const [stripeKey, setStripeKey] = useState('');
+  const { data: stripeConn, refetch: refetchStripe } = trpc.stripe.getConnection.useQuery({ storeId }, { enabled: isAuthenticated && storeId > 0 });
+  const stripeConnect = trpc.stripe.connect.useMutation({
+    onSuccess: () => { setStripeKey(''); toast.success('Separate Stripe account connected'); refetchStripe(); utils.metrics.getProfit.invalidate(); },
+    onError: error => toast.error(error.message),
+  });
+  const stripeDisconnect = trpc.stripe.disconnect.useMutation({
+    onSuccess: () => { refetchStripe(); utils.metrics.getProfit.invalidate(); toast.success('Stripe disconnected'); },
+    onError: error => toast.error(error.message),
+  });
   const [shopDomain, setShopDomain] = useState("");
   const [configuredShop, setConfiguredShop] = useState("");
   const [showManualShopify, setShowManualShopify] = useState(false);
@@ -174,6 +184,26 @@ export default function Connections() {
 
       <div className="container py-8 max-w-4xl">
         <div className="space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Separate Stripe payments</CardTitle>
+              <CardDescription>Connect the Stripe account that processes this store's Stripe Card Payments gateway to include its actual fees, refunds and disputes.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {stripeConn ? <>
+                <p className="text-sm font-medium">{stripeConn.accountName} · {stripeConn.accountId}</p>
+                <p className="text-sm text-muted-foreground">Connected to {stripeConn.shopDomain}. The ledger is read when you load or refresh profit.</p>
+                <Button variant="destructive" disabled={stripeDisconnect.isPending} onClick={() => stripeDisconnect.mutate({ storeId })}>Disconnect Stripe</Button>
+              </> : <>
+                <p className="text-sm text-muted-foreground">Use a dedicated live restricted key with Read access to Accounts, Balance, Balance Transaction Sources, Charges and Refunds, and Payment Disputes. Keep all Write permissions disabled. The key is encrypted on the server.</p>
+                <Label htmlFor="stripe-key">Restricted Stripe key</Label>
+                <Input id="stripe-key" type="password" autoComplete="off" value={stripeKey} onChange={event => setStripeKey(event.target.value)} placeholder="rk_live_…" />
+                <Button disabled={!shopifyConn || !stripeKey.trim() || stripeConnect.isPending} onClick={() => stripeConnect.mutate({ storeId, apiKey: stripeKey.trim() })}>
+                  {stripeConnect.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Connect separate Stripe account
+                </Button>
+              </>}
+            </CardContent>
+          </Card>
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between">

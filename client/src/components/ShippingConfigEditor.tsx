@@ -14,12 +14,13 @@ type Country = ShippingCountry;
 type QuantityPricing = Record<number, number | undefined>;
 type MethodPricing = Record<ShippingMethod, QuantityPricing>;
 type CountryPricing = Record<Country, MethodPricing>;
+type ProfilePricing = CountryPricing & { singleItemOrdersOnly?: boolean };
 
 interface ShippingConfigEditorProps {
   variantId: string;
   productTitle: string;
-  initialConfig?: Partial<CountryPricing>;
-  onSave: (config: CountryPricing) => void;
+  initialConfig?: Partial<ProfilePricing>;
+  onSave: (config: ProfilePricing) => void;
   isSaving?: boolean;
 }
 
@@ -41,11 +42,13 @@ export function ShippingConfigEditor({
   isSaving = false,
 }: ShippingConfigEditorProps) {
   const [config, setConfig] = useState<CountryPricing>(() => normalizeConfig(initialConfig));
+  const [singleItemOrdersOnly, setSingleItemOrdersOnly] = useState(initialConfig?.singleItemOrdersOnly === true);
 
   // Update config when initialConfig changes (for edit dialog)
   useEffect(() => {
     if (initialConfig) {
       setConfig(normalizeConfig(initialConfig));
+      setSingleItemOrdersOnly(initialConfig.singleItemOrdersOnly === true);
     }
   }, [initialConfig]);
 
@@ -115,7 +118,7 @@ export function ShippingConfigEditor({
       return;
     }
 
-    onSave(config);
+    onSave({ ...config, singleItemOrdersOnly });
   };
 
   return (
@@ -127,6 +130,20 @@ export function ShippingConfigEditor({
         </CardDescription>
       </CardHeader>
       <CardContent>
+        <div className="mb-4 space-y-1">
+          <Label className="flex items-center gap-2" htmlFor={`${variantId}-single-item-orders`}>
+            <input
+              id={`${variantId}-single-item-orders`}
+              type="checkbox"
+              checked={singleItemOrdersOnly}
+              onChange={event => setSingleItemOrdersOnly(event.target.checked)}
+            />
+            Rates apply only to single-item orders
+          </Label>
+          <p className="text-sm text-muted-foreground">
+            Enable when bundle prices are unknown. Orders with multiple physical items will show missing shipping costs.
+          </p>
+        </div>
         <Tabs defaultValue="US" className="w-full">
           <TabsList className="grid w-full grid-cols-6">
             {COUNTRIES.map(country => (

@@ -1,5 +1,28 @@
 import { describe, it, expect } from "vitest";
-import { computeShippingForLineItem } from "./profit-calculator";
+import { computeShippingForLineItem, computeShippingForOrderItems } from "./profit-calculator";
+
+describe('single-item supplier rates', () => {
+  const config = {
+    small: {profileId:1, singleItemOrdersOnly:true, US:{Standard:{'1':5}}},
+    large: {profileId:2, singleItemOrdersOnly:true, US:{Standard:{'1':12}}},
+    regular: {profileId:3, US:{Standard:{'1':7}}},
+  };
+  it('flags mixed sizes with different profiles instead of adding single-item prices', () => {
+    expect(computeShippingForOrderItems([{variant_id:'small',quantity:1},{variant_id:'large',quantity:1}], 'US','free',config))
+      .toEqual([{cost:0,configured:false},{cost:0,configured:false}]);
+  });
+  it('allows a single physical item with digital items and leaves ordinary profiles working', () => {
+    expect(computeShippingForOrderItems([{variant_id:'large',quantity:1},{variant_id:'digital',quantity:2,requires_shipping:false}], 'US','free',config))
+      .toEqual([{cost:12,configured:true},{cost:0,configured:true}]);
+    expect(computeShippingForOrderItems([{variant_id:'small',quantity:1},{variant_id:'regular',quantity:1}], 'US','free',config))
+      .toEqual([{cost:0,configured:false},{cost:7,configured:true}]);
+  });
+  it('does not extrapolate a one-item rate when a line has multiple items', () => {
+    expect(computeShippingForOrderItems([{variant_id:'small',quantity:3}], 'US','free',config))
+      .toEqual([{cost:0,configured:false}]);
+    expect(computeShippingForLineItem({variant_id:'small',quantity:3},'US','free',config)).toBe(0);
+  });
+});
 
 describe("Shipping Calculation", () => {
   it("should calculate shipping cost for US Standard shipping", () => {

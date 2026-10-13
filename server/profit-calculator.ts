@@ -110,6 +110,7 @@ function shippingPrice(
   const key = getItemConfigKey(item);
   const config = key ? shippingConfig[key] : undefined;
   if (!region || !config) return { cost: 0, configured: false };
+  if (config.singleItemOrdersOnly === true && item.quantity > 1) return { cost: 0, configured: false };
   const country = region === "USA" ? "US" : region === "CANADA" ? "CA" : region;
   const rates = config.rates ?? config;
   // Existing three-region profiles previously used EU prices for these destinations.
@@ -153,9 +154,14 @@ export function computeShippingForOrderItems(
 ): ShippingPrice[] {
   const result = items.map(() => ({ cost: 0, configured: true }));
   const groups = new Map<string, number[]>();
+  const physicalQuantity = items.reduce((sum, item) => sum + (item.requires_shipping === false ? 0 : Math.max(0, item.quantity)), 0);
   items.forEach((item, index) => {
     if (item.requires_shipping === false || item.quantity <= 0) return;
     const key = getItemConfigKey(item);
+    if (key && shippingConfig[key]?.singleItemOrdersOnly === true && physicalQuantity > 1) {
+      result[index] = { cost: 0, configured: false };
+      return;
+    }
     const profileId = key ? shippingConfig[key]?.profileId : undefined;
     // Direct variant configs retain their existing per-line behavior.
     const group = profileId == null ? `line:${index}` : `profile:${profileId}`;

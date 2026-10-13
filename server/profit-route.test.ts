@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   fetchStripeLedger: vi.fn(),
   getPayPalConnectionByStoreId: vi.fn(), upsertPayPalConnection: vi.fn(), deletePayPalConnection: vi.fn(),
   getPayPalReportingToken: vi.fn(), readPayPalPostings: vi.fn(), verifyPayPalConnection: vi.fn(), getUsdReportingRates: vi.fn(),
+  sharePayPalConnection: vi.fn(), getPayPalConnectionsForUser: vi.fn(), verifyPayPalShopifyIdentity: vi.fn(),
   getFacebookConnectionsByStoreId: vi.fn(),
   getFacebookConnectionsForUser: vi.fn(),
   getCogsConfigByStoreId: vi.fn(),
@@ -33,6 +34,8 @@ vi.mock("./db", async importOriginal => ({
   getPayPalConnectionByStoreId: mocks.getPayPalConnectionByStoreId,
   upsertPayPalConnection: mocks.upsertPayPalConnection,
   deletePayPalConnection: mocks.deletePayPalConnection,
+  sharePayPalConnection: mocks.sharePayPalConnection,
+  getPayPalConnectionsForUser: mocks.getPayPalConnectionsForUser,
   getFacebookConnectionsByStoreId: mocks.getFacebookConnectionsByStoreId,
   getFacebookConnectionsForUser: mocks.getFacebookConnectionsForUser,
   getCogsConfigByStoreId: mocks.getCogsConfigByStoreId,
@@ -53,7 +56,7 @@ vi.mock("./exchange-rate", async importOriginal => ({
 }));
 vi.mock("./facebook-data", () => ({ fetchFacebookAdSpend: mocks.fetchFacebookAdSpend }));
 vi.mock('./stripe-data', () => ({ fetchStripeLedger: mocks.fetchStripeLedger, verifyStripeConnection: mocks.verifyStripeConnection }));
-vi.mock('./paypal-data', async original => ({...await original<typeof import('./paypal-data')>(), getPayPalReportingToken: mocks.getPayPalReportingToken, readPayPalPostings: mocks.readPayPalPostings, verifyPayPalConnection: mocks.verifyPayPalConnection}));
+vi.mock('./paypal-data', async original => ({...await original<typeof import('./paypal-data')>(), getPayPalReportingToken: mocks.getPayPalReportingToken, readPayPalPostings: mocks.readPayPalPostings, verifyPayPalConnection: mocks.verifyPayPalConnection, verifyPayPalShopifyIdentity: mocks.verifyPayPalShopifyIdentity}));
 
 import { appRouter } from "./routers";
 const context = (): TrpcContext => ({
@@ -103,6 +106,32 @@ beforeEach(() => {
 });
 
 describe("dashboard profit with payment-posting dates", () => {
+  it('shares a reporting account only after checking both owners, Shopify identities and the PayPal merchant', async () => {
+    mocks.getStoreById.mockImplementation(async (id:number)=>({id,userId:1}));
+    mocks.getPayPalConnectionByStoreId.mockResolvedValue({accountNumber:'merchant1',shopDomain:'source.myshopify.com',clientId:'private-id',clientSecret:'private-secret'});
+    mocks.getShopifyConnectionByStoreId.mockImplementation(async (id:number)=>({shopDomain:id===43?'source.myshopify.com':'store.myshopify.com',accessToken:'read-shopify',apiVersion:'2026-07'}));
+    mocks.verifyPayPalShopifyIdentity.mockResolvedValueOnce('111').mockResolvedValueOnce('222');
+    mocks.verifyPayPalConnection.mockResolvedValue({accountNumber:'merchant1'});
+    const result=await appRouter.createCaller(context()).paypal.connectExisting({storeId:42,sourceStoreId:43,sharedAccountAcknowledged:true});
+    expect(result).toEqual({success:true});
+    expect(mocks.sharePayPalConnection).toHaveBeenCalledWith(1,43,42,'111','222','store.myshopify.com','merchant1');
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+  it('rejects sharing another owner’s account before reading its credentials', async () => {
+    mocks.getStoreById.mockImplementation(async (id:number)=>({id,userId:id===43?2:1}));
+    await expect(appRouter.createCaller(context()).paypal.connectExisting({storeId:42,sourceStoreId:43,sharedAccountAcknowledged:true})).rejects.toMatchObject({code:'NOT_FOUND'});
+    expect(mocks.getPayPalConnectionByStoreId).not.toHaveBeenCalled();
+    expect(mocks.sharePayPalConnection).not.toHaveBeenCalled();
+  });
+  it('includes only this store’s shared PayPal fees and losses and marks unmatched activity incomplete', async () => {
+    mocks.getPayPalConnectionByStoreId.mockResolvedValue({accountNumber:'merchant1',shopDomain:'store.myshopify.com',shopId:'111',allocationMode:'shopify',clientId:'id',clientSecret:'secret'});
+    const row=(id:string,shopId?:number)=>({transaction_id:id,transaction_event_code:'T1201',transaction_initiation_date:'2026-10-02T15:00:00Z',transaction_status:'S',transaction_amount:{currency_code:'USD',value:'-30'},fee_amount:{currency_code:'USD',value:'-2'},...(shopId?{custom_field:JSON.stringify({shop_id:shopId})}:{})});
+    mocks.readPayPalPostings.mockResolvedValue({postings:[row('this',111),row('other',222),row('unknown')],pageCount:1,availableThrough:'2026-10-03T00:00:00Z',incompleteRecentPeriod:false});
+    const result=await appRouter.createCaller(context()).metrics.getProfit(period);
+    expect(result.processingFees).toBe(5); expect(result.disputeValue).toBe(130); expect(result.netProfit).toBe(20);
+    expect(result.paypalUnattributedEvents).toBe(1); expect(result.dataQuality.paymentsVerified).toBe(false);
+    expect(result.dataQuality.warnings.join(' ')).toContain('1 shared PayPal events could not be assigned');
+  });
   it('protects PayPal credentials and connection changes from another store owner', async () => {
     mocks.getStoreById.mockResolvedValue({id:42,userId:2});
     const caller=appRouter.createCaller(context());

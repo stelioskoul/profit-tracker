@@ -10,6 +10,7 @@ export type PayPalPosting = {
   transaction_initiation_date: string; transaction_updated_date?: string; transaction_status?: string;
   transaction_amount: Money; fee_amount?: Money;
   paypal_reference_id?: string; paypal_reference_id_type?: string;
+  custom_field?: string;
 };
 const tokens = new Map<string, { value: string; expires: number }>();
 
@@ -45,6 +46,54 @@ export async function getPayPalReportingToken(clientId: string, clientSecret: st
 
 const empty = (): NativeBalanceTotals => ({ processingFees: 0, refunds: 0, disputeDebits: 0, disputeFees: 0,
   disputeRecoveries: 0, disputeFeeRecoveries: 0, disputeProtectionNet: 0, disputeNetLoss: 0, unclassifiedNet: 0 });
+
+/** Bind a shared reporting account to a Shopify identity verified by Shopify. */
+export async function verifyPayPalShopifyIdentity(shopDomain: string, accessToken: string, apiVersion: string) {
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shopDomain) || !/^\d{4}-\d{2}$/.test(apiVersion)) throw new Error('Invalid Shopify connection');
+  const response = await fetch(`https://${shopDomain}/admin/api/${apiVersion}/shop.json`, {
+    headers: { 'X-Shopify-Access-Token': accessToken }, redirect: 'error', signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error('Unable to verify the Shopify identity for PayPal allocation');
+  const { shop } = await response.json();
+  if (shop?.myshopify_domain !== shopDomain || !Number.isSafeInteger(shop.id) || shop.id <= 0) throw new Error('PayPal allocation Shopify identity does not match');
+  return String(shop.id);
+}
+
+/** No residual account spend or date split is assigned to a shared store. */
+export function allocatePayPalPostings(postings: PayPalPosting[], shopId: string) {
+  if (!/^[1-9]\d*$/.test(shopId)) throw new Error('A verified Shopify shop ID is required for PayPal allocation');
+  const parents = new Map<string, string>(), tags = new Map<string, Set<string>>();
+  const root = (id: string): string => {
+    let current = id;
+    while (parents.has(current)) current = parents.get(current)!;
+    let next = id;
+    while (parents.has(next)) { const previous = parents.get(next)!; parents.set(next, current); next = previous; }
+    return current;
+  };
+  for (const row of postings) {
+    if (!row.transaction_id) throw new Error('PayPal allocation event has no transaction ID');
+    if (row.paypal_reference_id_type === 'TXN' && row.paypal_reference_id) {
+      const left = root(row.transaction_id), right = root(row.paypal_reference_id);
+      if (left !== right) parents.set(left, right);
+    }
+  }
+  for (const row of postings) {
+    let value: unknown;
+    try { value = JSON.parse(row.custom_field || 'null')?.shop_id; } catch { continue; }
+    const id = typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? String(value) :
+      typeof value === 'string' && /^[1-9]\d*$/.test(value) ? value : undefined;
+    if (id) { const key = root(row.transaction_id), owners = tags.get(key) ?? new Set<string>(); owners.add(id); tags.set(key, owners); }
+  }
+  const allocated: PayPalPosting[] = [], unattributed: PayPalPosting[] = [];
+  let otherStoreCount = 0, conflictingCount = 0;
+  for (const row of postings) {
+    const owners = tags.get(root(row.transaction_id));
+    if (!owners?.size || owners.size > 1) { unattributed.push(row); if (owners && owners.size > 1) conflictingCount++; }
+    else if (owners.has(shopId)) allocated.push(row);
+    else otherStoreCount++;
+  }
+  return { postings: allocated, unattributed, otherStoreCount, conflictingCount };
+}
 
 function cents(money: Money) {
   if (!money || !/^[A-Z]{3}$/.test(money.currency_code) || !/^-?\d+(\.\d{1,2})?$/.test(money.value)) throw new Error('PayPal returned an invalid monetary amount');

@@ -1,4 +1,4 @@
-import { eq, and, getTableColumns } from "drizzle-orm";
+import { eq, and, getTableColumns, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { 
@@ -287,11 +287,44 @@ export async function upsertPayPalConnection(connection: InsertPayPalConnection)
   try {
     await db.insert(paypalConnections).values({ ...connection, clientId, clientSecret }).onConflictDoUpdate({
       target: paypalConnections.storeId,
-      set: { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain, clientId, clientSecret, connectedAt: new Date() },
+      set: { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain,
+        shopId: connection.shopId, allocationMode: connection.allocationMode ?? 'dedicated', clientId, clientSecret, connectedAt: new Date() },
     });
   } catch {
-    throw new Error('Could not save PayPal. Its account may already be connected to another store profile.');
+    throw new Error('Could not save PayPal. For an account already connected to another profile, use the shared account connection.');
   }
+}
+
+export async function getPayPalConnectionsForUser(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  return db.select({ id: paypalConnections.id, storeId: stores.id, storeName: stores.name,
+    accountNumber: paypalConnections.accountNumber, shopDomain: paypalConnections.shopDomain,
+    allocationMode: paypalConnections.allocationMode }).from(paypalConnections)
+    .innerJoin(stores, eq(stores.id, paypalConnections.storeId)).where(eq(stores.userId, userId));
+}
+
+export async function sharePayPalConnection(userId: number, sourceStoreId: number, targetStoreId: number,
+  sourceShopId: string, targetShopId: string, targetDomain: string, expectedAccountNumber: string) {
+  const db = await getDb();
+  if (!db) throw new Error('Database not available');
+  await db.transaction(async tx => {
+    const [source] = await tx.select({ connection: getTableColumns(paypalConnections) }).from(paypalConnections)
+      .innerJoin(stores, eq(stores.id, paypalConnections.storeId))
+      .where(and(eq(stores.userId, userId), eq(stores.id, sourceStoreId))).limit(1).for('update');
+    const [target] = await tx.select().from(stores).where(and(eq(stores.id, targetStoreId), eq(stores.userId, userId))).limit(1);
+    if (!source || !target || sourceStoreId === targetStoreId || sourceShopId === targetShopId) throw new Error('PayPal sharing requires two different owned Shopify stores');
+    if (source.connection.accountNumber !== expectedAccountNumber) throw new Error('Source PayPal account changed; refresh before sharing');
+    if (!source.connection.clientId.startsWith('v1:') || !source.connection.clientSecret.startsWith('v1:')) throw new Error('Source PayPal credentials must be encrypted');
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${source.connection.accountNumber}))`);
+    const [existing] = await tx.select().from(paypalConnections).where(eq(paypalConnections.storeId, targetStoreId)).limit(1);
+    if (existing) throw new Error('Disconnect the target profile’s existing PayPal connection before changing accounts');
+    if (source.connection.shopId && source.connection.shopId !== sourceShopId) throw new Error('Source Shopify identity changed; reconnect PayPal');
+    await tx.update(paypalConnections).set({ allocationMode: 'shopify', shopId: sourceShopId }).where(eq(paypalConnections.id, source.connection.id));
+    await tx.insert(paypalConnections).values({ storeId: targetStoreId, accountNumber: source.connection.accountNumber,
+      shopDomain: targetDomain, shopId: targetShopId, allocationMode: 'shopify',
+      clientId: source.connection.clientId, clientSecret: source.connection.clientSecret });
+  });
 }
 
 export async function deletePayPalConnection(storeId: number) {

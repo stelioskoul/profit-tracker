@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getPayPalReportingToken, readPayPalPostings, summarizePayPalPostings, type PayPalPosting } from './paypal-data';
+import { allocatePayPalPostings, getPayPalReportingToken, readPayPalPostings, summarizePayPalPostings, verifyPayPalShopifyIdentity, type PayPalPosting } from './paypal-data';
 afterEach(() => vi.unstubAllGlobals());
 const posting = (id: string, code: string, amount: string, fee?: string, extra: Partial<PayPalPosting> = {}): PayPalPosting => ({
   transaction_id: id, transaction_event_code: code, transaction_initiation_date: '2026-01-02T00:00:00Z', transaction_status: 'S',
@@ -8,6 +8,47 @@ const posting = (id: string, code: string, amount: string, fee?: string, extra: 
 });
 const response = (rows: PayPalPosting[], extra = {}) => new Response(JSON.stringify({ account_number: 'merchant1', page: 1, total_items: rows.length,
   total_pages: 1, last_refreshed_datetime: '2026-10-10T20:00:00Z', transaction_details: rows.map(transaction_info => ({ transaction_info })), ...extra }));
+
+describe('shared PayPal store attribution', () => {
+  it('assigns linked dispute fees and recoveries to their original Shopify store, without charging the other store', () => {
+    const rows = [
+      posting('sale-a', 'T0006', '100', '-4', { custom_field: '{"shop_id":111}' }),
+      posting('sale-b', 'T0006', '200', '-8', { custom_field: '{"shop_id":"222"}' }),
+      posting('loss-a', 'T1201', '-100', undefined, { paypal_reference_id_type:'TXN', paypal_reference_id:'sale-a' }),
+      posting('fee-a', 'T0114', '-20', undefined, { paypal_reference_id_type:'TXN', paypal_reference_id:'loss-a' }),
+      posting('credit-a', 'T1108', '10', undefined, { paypal_reference_id_type:'TXN', paypal_reference_id:'fee-a' }),
+      posting('recover-b', 'T1202', '40', undefined, { paypal_reference_id_type:'TXN', paypal_reference_id:'sale-b' }),
+    ];
+    const a = allocatePayPalPostings(rows, '111'), b = allocatePayPalPostings(rows, '222');
+    expect(a.unattributed).toEqual([]); expect(b.unattributed).toEqual([]);
+    expect(summarizePayPalPostings(a.postings, {USD:1}).reporting).toMatchObject({processingFees:4,disputeNetLoss:110});
+    expect(summarizePayPalPostings(b.postings, {USD:1}).reporting).toMatchObject({processingFees:8,disputeNetLoss:-40});
+    expect(new Set([...a.postings, ...b.postings]).size).toBe(rows.length);
+  });
+  it('excludes ambiguous or missing identifiers and never assigns residual account activity to either profile', () => {
+    const rows = [posting('outside-parent','T1201','-50',undefined,{paypal_reference_id_type:'TXN',paypal_reference_id:'outside'}),
+      posting('plain','T0006','100','-4',{custom_field:'Shopify'}),
+      posting('a','T0006','100','-4',{custom_field:'{"shop_id":111}',paypal_reference_id_type:'TXN',paypal_reference_id:'conflict'}),
+      posting('b','T0114','-20',undefined,{custom_field:'{"shop_id":222}',paypal_reference_id_type:'TXN',paypal_reference_id:'conflict'})];
+    const result=allocatePayPalPostings(rows,'111');
+    expect(result.postings).toEqual([]); expect(result.unattributed).toHaveLength(4); expect(result.conflictingCount).toBe(2);
+  });
+  it('keeps non-transaction reference types separate and handles repeated IDs and cyclic references safely', () => {
+    const rows=[posting('a','T0006','100','-4',{custom_field:'{"shop_id":111}',paypal_reference_id_type:'TXN',paypal_reference_id:'b'}),
+      posting('b','T0114','-20',undefined,{paypal_reference_id_type:'TXN',paypal_reference_id:'a'}),
+      posting('b','T1108','10'), posting('other','T1201','-50',undefined,{paypal_reference_id_type:'ODR',paypal_reference_id:'a'})];
+    const result=allocatePayPalPostings(rows,'111');
+    expect(result.postings).toHaveLength(3); expect(result.unattributed.map(r=>r.transaction_id)).toEqual(['other']);
+    expect(()=>allocatePayPalPostings(rows,'')).toThrow('verified');
+  });
+  it('rejects a mismatched Shopify identity before allowing a shared financial binding', async () => {
+    const fetch=vi.fn().mockResolvedValue(new Response(JSON.stringify({shop:{id:111,myshopify_domain:'other.myshopify.com'}})));
+    vi.stubGlobal('fetch',fetch);
+    await expect(verifyPayPalShopifyIdentity('store.myshopify.com','read-token','2026-07')).rejects.toThrow('does not match');
+    fetch.mockResolvedValue(new Response(JSON.stringify({shop:{id:111,myshopify_domain:'store.myshopify.com'}})));
+    expect(await verifyPayPalShopifyIdentity('store.myshopify.com','read-token','2026-07')).toBe('111');
+  });
+});
 
 describe('PayPal money movements', () => {
   it('counts actual principal, fees and partial recoveries once, while excluding dispute holds and cash transfers', () => {

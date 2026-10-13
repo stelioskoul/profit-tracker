@@ -17,7 +17,7 @@ import { calculateProfitBreakdown } from "./profit-formula";
 import { referenceUtcOffsetMinutes, validateDateRange } from "./shopify-date";
 import { assertOrderHistoryAccess } from "./shopify-order-access";
 import { fetchStripeLedger, verifyStripeConnection } from './stripe-data';
-import { getPayPalReportingToken, readPayPalPostings, summarizePayPalPostings, verifyPayPalConnection } from './paypal-data';
+import { allocatePayPalPostings, getPayPalReportingToken, readPayPalPostings, summarizePayPalPostings, verifyPayPalConnection, verifyPayPalShopifyIdentity } from './paypal-data';
 import { allocatedAdPeriod, adPeriodsOverlap } from './ad-spend-dates';
 import { getEurUsdRate, getCachedRate, getUsdReportingRates } from "./exchange-rate";
 import { adminRouter } from "./admin-router";
@@ -526,7 +526,29 @@ export const appRouter = router({
       const store = await db.getStoreById(input.storeId);
       if (!store || store.userId !== ctx.user.id) throw new TRPCError({ code: 'NOT_FOUND' });
       const connection = await db.getPayPalConnectionByStoreId(input.storeId);
-      return connection ? { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain, connectedAt: connection.connectedAt } : null;
+      return connection ? { accountNumber: connection.accountNumber, shopDomain: connection.shopDomain,
+        allocationMode: connection.allocationMode, connectedAt: connection.connectedAt } : null;
+    }),
+    availableConnections: protectedProcedure.query(({ ctx }) => db.getPayPalConnectionsForUser(ctx.user.id)),
+    connectExisting: protectedProcedure.input(z.object({ storeId: z.number(), sourceStoreId: z.number(),
+      sharedAccountAcknowledged: z.literal(true) })).mutation(async ({ ctx, input }) => {
+      const stores = await Promise.all([db.getStoreById(input.storeId), db.getStoreById(input.sourceStoreId)]);
+      if (input.storeId === input.sourceStoreId || stores.some(store => !store || store.userId !== ctx.user.id)) throw new TRPCError({ code: 'NOT_FOUND' });
+      const source = await db.getPayPalConnectionByStoreId(input.sourceStoreId);
+      const [sourceShopify, targetShopify] = await Promise.all([
+        db.getShopifyConnectionByStoreId(input.sourceStoreId), db.getShopifyConnectionByStoreId(input.storeId),
+      ]);
+      if (!source || !sourceShopify || !targetShopify || source.shopDomain !== sourceShopify.shopDomain) throw new TRPCError({ code: 'BAD_REQUEST', message: 'Both profiles need their verified Shopify connections before sharing PayPal' });
+      try {
+        const [sourceId, targetId, account] = await Promise.all([
+          verifyPayPalShopifyIdentity(sourceShopify.shopDomain, sourceShopify.accessToken, sourceShopify.apiVersion || '2026-07'),
+          verifyPayPalShopifyIdentity(targetShopify.shopDomain, targetShopify.accessToken, targetShopify.apiVersion || '2026-07'),
+          verifyPayPalConnection(source.clientId, source.clientSecret),
+        ]);
+        if (account.accountNumber !== source.accountNumber) throw new Error('PayPal account identity changed');
+        await db.sharePayPalConnection(ctx.user.id, input.sourceStoreId, input.storeId, sourceId, targetId, targetShopify.shopDomain, source.accountNumber);
+      } catch (error) { throw new TRPCError({ code: 'BAD_REQUEST', message: (error as Error).message }); }
+      return { success: true };
     }),
     connect: protectedProcedure.input(z.object({ storeId: z.number(), clientId: z.string().trim().regex(/^[A-Za-z0-9_-]{20,255}$/),
       clientSecret: z.string().trim().regex(/^[A-Za-z0-9_-]{20,255}$/), credentialsAcknowledged: z.literal(true) })).mutation(async ({ ctx, input }) => {
@@ -794,6 +816,7 @@ export const appRouter = router({
         let paypalLedgerByCurrency: Record<string, NativeBalanceTotals> = {};
         let paypalLedgerPages = 0;
         let paypalAvailableThrough: string | null = null;
+        let paypalUnattributedEvents = 0;
         let outsideGatewaysMissing: string[] = [];
 
         if (shopifyConn) {
@@ -863,7 +886,9 @@ export const appRouter = router({
             if (paypalConn.shopDomain !== shopifyConn.shopDomain) throw new Error('PayPal is connected to a different Shopify store');
             const token = await getPayPalReportingToken(paypalConn.clientId, paypalConn.clientSecret);
             const paypalLedger = await readPayPalPostings(token, period, offset, store.timezone, paypalConn.accountNumber);
-            const paypal = summarizePayPalPostings(paypalLedger.postings, await getUsdReportingRates());
+            const allocation = paypalConn.allocationMode === 'shopify' ? allocatePayPalPostings(paypalLedger.postings, paypalConn.shopId || '') : undefined;
+            paypalUnattributedEvents = allocation?.unattributed.length ?? 0;
+            const paypal = summarizePayPalPostings(allocation?.postings ?? paypalLedger.postings, await getUsdReportingRates());
             paypalLedgerByCurrency = paypal.byCurrency;
             paypalLedgerPages = paypalLedger.pageCount;
             paypalAvailableThrough = paypalLedger.availableThrough;
@@ -878,7 +903,10 @@ export const appRouter = router({
             unclassifiedTypes.push(...paypal.unclassifiedTypes.map(type => `PayPal:${type}`));
             unreconciledLedgerCount += paypal.unclassifiedCount;
             unreconciledLedgerNet += paypal.reporting.unclassifiedNet;
-            warnings.push('PayPal reporting covers the dedicated account connected to this profile, with no store-transition date split. Events follow their reported update date and can change when PayPal revises records. Sales principal is not added again. Temporary holds, reserve releases, currency transfers and bank withdrawals are excluded from operating profit.');
+            warnings.push(allocation ? 'Shared PayPal postings are assigned using Shopify shop IDs and related PayPal transaction references. Only this store’s matched events are included; no dates or residual account costs determine ownership.' : 'PayPal reporting covers the dedicated account connected to this profile, with no store-transition date split.');
+            warnings.push('PayPal events follow their reported update date and can change when PayPal revises records. Sales principal is not added again. Temporary holds, reserve releases, currency transfers and bank withdrawals are excluded from operating profit.');
+            if (allocation?.unattributed.length) warnings.push(`${allocation.unattributed.length} shared PayPal events could not be assigned to a Shopify store and were excluded. Their fees, refunds or disputes may be missing from profit. An original payment outside this report or missing Shopify metadata requires separate reconciliation.`);
+            if (allocation?.conflictingCount) warnings.push(`${allocation.conflictingCount} PayPal events have conflicting store references and need reconciliation.`);
             if (paypal.outgoingPaymentCount) warnings.push(`${paypal.outgoingPaymentCount} outgoing PayPal purchases were excluded. Reconcile these against advertising, supplier costs and operating expenses before adding them, to avoid counting the same cost twice.`);
             if (paypal.unmatchedFeeCredits) warnings.push(`${paypal.unmatchedFeeCredits} PayPal fee credits reduce provider fees because their original fee is outside this report. The period's dispute-fee-return subtotal therefore needs separate attribution.`);
             if (paypalLedger.incompleteRecentPeriod) warnings.push(`PayPal reports are currently available through ${paypalAvailableThrough}; recent transactions may not have appeared yet.`);
@@ -1049,6 +1077,7 @@ export const appRouter = router({
           paypalLedgerPages,
           paypalAvailableThrough,
           paypalConnected: !!paypalConn,
+          paypalUnattributedEvents,
           operationalExpenses,
           exchangeRateUsed: rate,
           totalCosts: breakdown.totalCosts,
@@ -1068,7 +1097,7 @@ export const appRouter = router({
           },
           dataQuality: {
             shopifyConnected: !!shopifyConn,
-            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !ledgerFxApproximate && !outsideGatewaysMissing.length,
+            paymentsVerified: !!shopifyConn && !unclassifiedTypes.length && !ledgerFxApproximate && !outsideGatewaysMissing.length && !paypalUnattributedEvents,
             ledgerPages,
             fxApproximate,
             perOrderFeeEstimates,

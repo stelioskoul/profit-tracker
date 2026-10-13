@@ -40,13 +40,20 @@ export default function Connections() {
   const [paypalClientId, setPaypalClientId] = useState('');
   const [paypalSecret, setPaypalSecret] = useState('');
   const [paypalAcknowledged, setPaypalAcknowledged] = useState(false);
+  const [paypalSourceStore, setPaypalSourceStore] = useState('');
+  const [paypalSharedAcknowledged, setPaypalSharedAcknowledged] = useState(false);
   const { data: paypalConn, refetch: refetchPayPal } = trpc.paypal.getConnection.useQuery({ storeId }, { enabled: isAuthenticated && storeId > 0 });
+  const { data: existingPayPal } = trpc.paypal.availableConnections.useQuery(undefined, { enabled: isAuthenticated });
+  const paypalSharedConnect = trpc.paypal.connectExisting.useMutation({
+    onSuccess: () => { setPaypalSourceStore(''); setPaypalSharedAcknowledged(false); refetchPayPal(); utils.paypal.availableConnections.invalidate(); utils.metrics.getProfit.invalidate(); toast.success('Shared PayPal reporting connected'); },
+    onError: error => toast.error(error.message),
+  });
   const paypalConnect = trpc.paypal.connect.useMutation({
-    onSuccess: () => { setPaypalClientId(''); setPaypalSecret(''); setPaypalAcknowledged(false); refetchPayPal(); utils.metrics.getProfit.invalidate(); toast.success('PayPal reporting connected'); },
+    onSuccess: () => { setPaypalClientId(''); setPaypalSecret(''); setPaypalAcknowledged(false); refetchPayPal(); utils.paypal.availableConnections.invalidate(); utils.metrics.getProfit.invalidate(); toast.success('PayPal reporting connected'); },
     onError: error => toast.error(error.message),
   });
   const paypalDisconnect = trpc.paypal.disconnect.useMutation({
-    onSuccess: () => { refetchPayPal(); utils.metrics.getProfit.invalidate(); toast.success('PayPal disconnected'); },
+    onSuccess: () => { refetchPayPal(); utils.paypal.availableConnections.invalidate(); utils.metrics.getProfit.invalidate(); toast.success('PayPal disconnected'); },
     onError: error => toast.error(error.message),
   });
   const { data: stripeConn, refetch: refetchStripe } = trpc.stripe.getConnection.useQuery({ storeId }, { enabled: isAuthenticated && storeId > 0 });
@@ -216,13 +223,24 @@ export default function Connections() {
       <div className="container py-8 max-w-4xl">
         <div className="space-y-6">
           <Card>
-            <CardHeader><CardTitle>PayPal reporting</CardTitle><CardDescription>Connect this store's dedicated live PayPal account for actual fees, refunds and dispute postings.</CardDescription></CardHeader>
+            <CardHeader><CardTitle>PayPal reporting</CardTitle><CardDescription>Connect this store’s live PayPal account for actual fees, refunds and dispute postings.</CardDescription></CardHeader>
             <CardContent className="space-y-4">
               {paypalConn ? <>
                 <p className="text-sm font-medium">PayPal account {paypalConn.accountNumber}</p>
-                <p className="text-sm text-muted-foreground">Connected only to {paypalConn.shopDomain}. All requested dates belong to this store. Profit Tracker obtains reporting-only tokens and reads transactions; it cannot issue payments using those tokens.</p>
+                <p className="text-sm text-muted-foreground">{paypalConn.allocationMode === 'shopify' ? `Shared account: only activity matched to ${paypalConn.shopDomain} is included. Unmatched transactions are excluded and flagged for review.` : `Dedicated account for ${paypalConn.shopDomain}. All requested dates belong to this store.`} Profit Tracker uses reporting-only tokens to read transactions.</p>
                 <Button variant="destructive" disabled={paypalDisconnect.isPending} onClick={() => paypalDisconnect.mutate({ storeId })}>Disconnect PayPal</Button>
               </> : <>
+                {!!existingPayPal?.some(connection => connection.storeId !== storeId) && <div className="space-y-3 border-b pb-4">
+                  <Label htmlFor="paypal-source-store">Use an account connected to another store</Label>
+                  <Select value={paypalSourceStore} onValueChange={value => { setPaypalSourceStore(value); setPaypalSharedAcknowledged(false); }}>
+                    <SelectTrigger id="paypal-source-store"><SelectValue placeholder="Select a connected PayPal account" /></SelectTrigger>
+                    <SelectContent>{existingPayPal.filter(connection => connection.storeId !== storeId).map(connection => <SelectItem key={connection.storeId} value={String(connection.storeId)}>{connection.storeName} · {connection.accountNumber}</SelectItem>)}</SelectContent>
+                  </Select>
+                  <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={paypalSharedAcknowledged} onChange={event => setPaypalSharedAcknowledged(event.target.checked)} />This PayPal account serves both stores. Assign fees and disputes to each store and flag unmatched transactions for review.</label>
+                  <Button disabled={!shopifyConn || !paypalSourceStore || !paypalSharedAcknowledged || paypalSharedConnect.isPending} onClick={() => paypalSharedConnect.mutate({ storeId, sourceStoreId: Number(paypalSourceStore), sharedAccountAcknowledged: true })}>
+                    {paypalSharedConnect.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Connect shared PayPal reporting
+                  </Button>
+                </div>}
                 <p className="text-sm text-muted-foreground">Create a dedicated live app with Transaction Search enabled and other features disabled. Profit Tracker requests only transaction-reporting tokens. PayPal's client secret can still authorize broader APIs even with these settings; it is encrypted on the server to refresh reporting tokens automatically.</p>
                 <Label htmlFor="paypal-client-id">Live PayPal client ID</Label><Input id="paypal-client-id" type="password" autoComplete="off" value={paypalClientId} onChange={event => setPaypalClientId(event.target.value)} />
                 <Label htmlFor="paypal-secret">Live PayPal client secret</Label><Input id="paypal-secret" type="password" autoComplete="off" value={paypalSecret} onChange={event => setPaypalSecret(event.target.value)} />

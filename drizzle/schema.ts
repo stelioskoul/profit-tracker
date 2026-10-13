@@ -108,12 +108,14 @@ export const stripeConnections = pgTable('stripe_connections', {
 });
 export type InsertStripeConnection = typeof stripeConnections.$inferInsert;
 
-/** Dedicated PayPal account: never shared between store profiles. */
+/** Shared accounts require verified Shopify identities and posting attribution. */
 export const paypalConnections = pgTable('paypal_connections', {
   id: serial('id').primaryKey(),
   storeId: integer('storeId').notNull().unique().references(() => stores.id, { onDelete: 'cascade' }),
-  accountNumber: varchar('accountNumber', { length: 255 }).notNull().unique(),
+  accountNumber: varchar('accountNumber', { length: 255 }).notNull(),
   shopDomain: varchar('shopDomain', { length: 255 }).notNull(),
+  shopId: varchar('shopId', { length: 32 }),
+  allocationMode: varchar('allocationMode', { length: 20 }).notNull().default('dedicated'),
   clientId: text('clientId').notNull(),
   clientSecret: text('clientSecret').notNull(),
   connectedAt: timestamp('connectedAt', { withTimezone: true }).defaultNow().notNull(),
